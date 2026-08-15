@@ -2,8 +2,8 @@
   {
     "field": "core-original_sender",
     "type": "func",
-    "func": "level4_funcs.major_provider_sender",
-    "comment": "TODO(tuning): this only passes live.com / outlook.com / gmail.com senders, so a legitimate greylisted institution reads as suspicious and gets flagged by the level-4 assessment. Prototype logic-quality issue; revisit with a regression corpus."
+    "func": "level4_funcs.sender_on_trusted_list",
+    "comment": "Confirms the trusted-list membership that got the message to level 4 in the first place. Replaces the prototype's major-provider check, which failed every greylisted institution and so kept all legitimate service mail out of the cleared tier."
   },
   { "field": "core-title", "type": "ignore" },
   { "field": "core-clean_text", "type": "ignore" },

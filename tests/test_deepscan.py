@@ -282,13 +282,66 @@ def test_level3_hop_count_with_srs(pack):
     assert func(2, {}, plain) == "pass"
 
 
-def test_level4_major_provider_sender(pack):
-    func = pack.resolve_func("level4_funcs.major_provider_sender")
-    assert func("someone@gmail.com", {}, {}) == "pass"
-    assert func("someone@outlook.com", {}, {}) == "pass"
-    assert func("someone@live.com", {}, {}) == "pass"
-    # The documented TODO: a legitimate greylisted institution reads as a fail.
-    assert func("payments@pay.northgate-bank.example", {}, {}) == "fail"
+def test_level4_sender_on_trusted_list(pack):
+    """Fix A: level 4 confirms list membership, not a hardcoded provider list."""
+    func = pack.resolve_func("level4_funcs.sender_on_trusted_list")
+    sender = "payments@pay.northgate-bank.example"
+
+    # Greylist-recognised (triage rule 4) and whitelisted (rule 7) both pass...
+    assert func(sender, {"greylist_hit": True, "whitelist_hit": False}, {}) == "pass"
+    assert func(sender, {"greylist_hit": False, "whitelist_hit": True}, {}) == "pass"
+    assert func(sender, {"greylist_hit": True, "whitelist_hit": True}, {}) == "pass"
+
+    # ...and an off-list sender that somehow reached level 4 does not.
+    assert func(sender, {"greylist_hit": False, "whitelist_hit": False}, {}) == "fail"
+    assert func(sender, {}, {}) == "fail"
+
+    # The sender string itself is no longer what decides the outcome: a major
+    # consumer provider with no list hit still fails.
+    assert func("someone@gmail.com", {}, {}) == "fail"
+
+
+def test_level4_major_provider_rule_is_gone(pack):
+    """The replaced rule must not linger in the pack."""
+    import pytest as _pytest
+
+    from email_guard.rulespack import InvalidRulesPack
+
+    with _pytest.raises(InvalidRulesPack):
+        pack.resolve_func("level4_funcs.major_provider_sender")
+
+
+# --- fix B: SRS-aware return-path alignment ------------------------------------
+
+
+def test_level2_return_path_is_srs_aware(pack):
+    """Fix B: a forwarded return path embeds the original domain -- accept it.
+
+    All inbound mail is SRS-forwarded, so the envelope return path belongs to
+    the forwarder. The old plain substring test failed for every forwarded
+    message and returned ``fail_critical``.
+    """
+    func = pack.resolve_func("level2_funcs.return_path_alignment")
+    context = {"senderDomain": "pay.northgate-bank.example"}
+
+    # SRS embeds the parent domain while the sender is a subdomain.
+    srs = "<owner+SRS=7AqCh=DM=northgate-bank.example=payments@example.net>"
+    assert func(srs, {}, dict(context)) == "pass"
+
+    # SRS naming a different organisation entirely is still a forgery signal.
+    wrong = "<owner+SRS=x=DM=evil.example=a@example.net>"
+    assert func(wrong, {}, dict(context)) == "fail_critical"
+
+
+def test_level2_return_path_non_srs_behaviour_is_unchanged(pack):
+    """Without an SRS token nothing was rewritten, so the direct check stands."""
+    func = pack.resolve_func("level2_funcs.return_path_alignment")
+    context = {"senderDomain": "pay.northgate-bank.example"}
+
+    assert func("<payments@pay.northgate-bank.example>", {}, dict(context)) == "pass"
+    assert func("<attacker@evil.example>", {}, dict(context)) == "fail_critical"
+    # No sender domain to compare against -- the prototype passes.
+    assert func("<anything>", {}, {"senderDomain": ""}) == "pass"
 
 
 def test_link_rules_see_real_hosts_through_the_defanging(pack):

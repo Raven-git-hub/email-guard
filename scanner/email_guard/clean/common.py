@@ -152,18 +152,23 @@ def _sender_address(parsed: dict[str, Any], metadata: dict[str, Any]) -> str:
 def _friendly_name(sender, prefix, black_entry, grey_entry, white_entry) -> str:
     """Default ``<source>-<localpart>``, overridden by list entries.
 
-    Order matches the prototype: blacklist, then greylist, then whitelist, so the
-    most-trusted list wins. Unlike the prototype an entry without a
-    ``friendly_name`` (every greylist entry in the live schema) no longer
-    clobbers the name with ``undefined``.
+    Resolved by *verdict* priority -- blacklist, then whitelist, then greylist --
+    so the label always names the list that decided the outcome. The prototype
+    applied blacklist, greylist, whitelist with the last hit winning, which meant
+    a sender on both the blacklist and the whitelist was rejected at level 1
+    while being captioned with its whitelist name. Triage rule 1 gives the
+    blacklist the final say on the level; the display name now agrees with it.
+
+    Unlike the prototype an entry without a ``friendly_name`` (every greylist
+    entry in the live schema) no longer clobbers the name with ``undefined``.
     """
     friendly = "Unknown"
     if sender != "unknown" and sender.count("@") == 1:
         friendly = f"{prefix}-{sender.split('@')[0]}"
 
-    for entry in (black_entry, grey_entry, white_entry):
+    for entry in (black_entry, white_entry, grey_entry):
         if entry and entry.get("friendly_name"):
-            friendly = entry["friendly_name"]
+            return entry["friendly_name"]
     return friendly
 
 

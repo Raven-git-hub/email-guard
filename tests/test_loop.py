@@ -213,17 +213,42 @@ def test_suspicious_level4_downgrades_to_flagged_never_to_trusted(
 
 
 def test_level4_fix_end_to_end(scan):
-    """A greylisted sender with a perfect level-3 profile: 3 -> 4 -> 3."""
-    verdict = scan("json/greylist_clean_profile.json")
+    """A message promoted to 4 that then fails the deep dive: 3 -> 4 -> 3.
+
+    ``simple.eml`` comes from a domain on no list. Its level-3 profile is strong
+    enough to be promoted to level 4, where the sender rule finds no trusted-list
+    membership, so the corrected assessment downgrades it to 3 rather than
+    promoting it to the most-trusted tier.
+
+    This fixture replaced ``greylist_clean_profile.json`` here: that message is
+    greylisted, so once the level-4 sender rule started confirming list
+    membership it legitimately clears at 4 and no longer exercises the
+    suspicious branch.
+    """
+    verdict = scan("eml/simple.eml")
 
     assert verdict["initial_level"] == 3
     assert verdict["final_level"] == 3
+    assert verdict["final_level"] != 5
     assert verdict["bucket"] == "flagged"
 
     log = " | ".join(verdict["forensic_log"])
     assert "Downgrading to Level 4" in log
     assert "Suspicious patterns identified" in log
     assert "level4" in log
+
+
+def test_level4_clean_dive_end_to_end(scan):
+    """The other branch: a greylisted message with clean links confirms at 4."""
+    verdict = scan("json/greylist_clean_profile.json")
+
+    assert verdict["initial_level"] == 3
+    assert verdict["final_level"] == 4
+    assert verdict["bucket"] == "cleared"
+
+    log = " | ".join(verdict["forensic_log"])
+    assert "Downgrading to Level 4" in log
+    assert "confirms legitimate service infrastructure" in log
 
 
 # --- routing -------------------------------------------------------------------

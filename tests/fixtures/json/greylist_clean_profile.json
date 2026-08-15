@@ -1,5 +1,5 @@
 {
-  "_fixture_note": "SYNTHETIC message (fake sender, fake recipient). Built to drive the level-4 path: greylisted domain with no matching structure -> triage 3; a perfect level-3 confidence profile (transactional Ref, aligned DKIM, SER- mailer, no links) -> assessed up to 4; then the level-4 sender rule fails on a non-major-provider domain -> downgraded to 3. Locks in the level-5 inversion fix on a full pipeline run.",
+  "_fixture_note": "SYNTHETIC message (fake sender, fake recipient). Drives the level-4 path: greylisted domain with no matching structure -> triage 3; a perfect level-3 confidence profile (transactional Ref, aligned DKIM, SER- mailer, no links) -> promoted to 4; the level-4 sender rule confirms greylist membership and the links are clean, so the deep dive confirms level 4 / cleared. The suspicious branch of the level-5 inversion fix is exercised by tests/fixtures/eml/simple.eml, whose sender is on no list.",
   "textHtml": "<html><body><p>Dear Customer,</p><p>Thank you for your recent transaction. The details are recorded below for your records.</p><p>Amount: 42.00<br>Posted: 2026-05-15</p><p>This is a servicing message. No reply is needed.</p></body></html>",
   "textPlain": "",
   "metadata": {

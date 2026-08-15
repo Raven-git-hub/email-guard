@@ -9,33 +9,30 @@ from typing import Any
 
 from email_guard.links import link_host, registrable_domain
 
-MAJOR_PROVIDERS = ("live.com", "outlook.com", "gmail.com")
-
 # URL shorteners and dynamic-DNS hosts: a link that hides its real destination
 # has no business in mail that has reached the cleared tier.
 SHORTENER_HOSTS = frozenset({"bit.ly", "t.co"})
 SHORTENER_LABELS = frozenset({"tinyurl", "duckdns"})
 
 
-def major_provider_sender(value: Any, message: dict, context: dict) -> str:
-    """Pass senders on a major consumer provider, fail everything else.
+def sender_on_trusted_list(value: Any, message: dict, context: dict) -> str:
+    """Confirm the sender is on a trusted list.
 
-    TODO(tuning): this is the prototype's rule verbatim, and it is too narrow.
-    A legitimate greylisted institution -- a bank, an airline, a utility --
-    is not one of these three consumer providers, so it returns ``fail`` here,
-    the level-4 assessment reads that as "suspicious", and the message is
-    downgraded to level 3 (flagged for review). Anything reaching level 4 has
-    already matched a greylist entry, so the sender check arguably wants to
-    compare against the *matched list entry* rather than a hardcoded provider
-    list. Left as-is pending a regression corpus to tune against.
+    Replaces the prototype's ``major_provider_sender``, which passed only
+    ``live.com`` / ``outlook.com`` / ``gmail.com`` senders. Every greylisted
+    institution -- a bank, an airline, a utility -- failed that check, the
+    level-4 assessment read the failure as "suspicious", and the message was
+    downgraded to 3. Nothing from a real service could ever reach ``cleared``.
 
-    This is currently the dominant reason legitimate greylisted mail lands on
-    ``flagged`` rather than ``cleared``.
+    Reaching level 4 already means a trusted list matched: triage rule 4
+    (greylist structure recognised) or rule 7 (whitelisted sender with
+    attachments). So the right question at this depth is whether that list
+    membership still holds, not which consumer provider hosts the mailbox.
+
+    Failing when neither flag is set is deliberate and defensive: a message that
+    somehow arrives at level 4 off-list has not earned the cleared tier.
     """
-    text = str(value or "")
-    domain = text.split("@")[1] if "@" in text else ""
-    is_major = any(domain.endswith(provider) for provider in MAJOR_PROVIDERS)
-    return "pass" if is_major else "fail"
+    return "pass" if (message.get("whitelist_hit") or message.get("greylist_hit")) else "fail"
 
 
 def shortener_links(value: Any, message: dict, context: dict) -> str:

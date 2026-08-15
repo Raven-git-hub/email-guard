@@ -176,10 +176,31 @@ def test_blacklisted_sender_is_level_1_even_when_also_whitelisted(scan, tmp_path
     assert verdict["final_level"] == 1
     assert verdict["bucket"] == "rejected"
 
-    # Separate concern, asserted so it is visible rather than surprising: the
-    # friendly NAME still resolves blacklist -> greylist -> whitelist with the
-    # last hit winning (the prototype's order), so a conflicted sender is
-    # rejected while displaying its whitelist label.
-    # TODO(display): make the name follow the same precedence as the level, so a
-    # rejected message is never captioned "Trusted ...".
-    assert verdict["friendly_name"] == "Listed Twice (whitelist side)"
+    # Fix C: the label now names the list that decided the outcome. The
+    # prototype resolved blacklist -> greylist -> whitelist with the last hit
+    # winning, so this rejected message was captioned with its whitelist name.
+    assert verdict["friendly_name"] == "Listed Twice (blacklist side)"
+
+
+def test_friendly_name_resolves_by_verdict_priority(lists):
+    """Fix C, at the unit level: blacklist beats whitelist beats greylist.
+
+    Only the ordering changed -- a sender on a single list, or on none, keeps
+    the name it had before.
+    """
+    from email_guard.clean.common import _friendly_name
+
+    black = {"friendly_name": "Bad Actor"}
+    white = {"friendly_name": "Trusted Friend"}
+    grey = {"friendly_name": "Some Service"}
+
+    assert _friendly_name("a@x.example", "outlook", black, grey, white) == "Bad Actor"
+    assert _friendly_name("a@x.example", "outlook", None, grey, white) == "Trusted Friend"
+    assert _friendly_name("a@x.example", "outlook", None, grey, None) == "Some Service"
+
+    # No list hit at all falls back to "<source>-<localpart>".
+    assert _friendly_name("a@x.example", "outlook", None, None, None) == "outlook-a"
+
+    # A greylist entry carrying no friendly_name (the live schema) must not
+    # clobber the fallback with an empty value.
+    assert _friendly_name("a@x.example", "proton", None, {"domain": "x.example"}, None) == "proton-a"

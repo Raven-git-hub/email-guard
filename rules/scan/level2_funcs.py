@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from email_guard.links import link_aligned_with
+from email_guard.links import link_aligned_with, registrable_domain
 
 
 def capture_sender_domain(value: Any, message: dict, context: dict) -> str:
@@ -32,12 +32,42 @@ def capture_sender_domain(value: Any, message: dict, context: dict) -> str:
 
 
 def return_path_alignment(value: Any, message: dict, context: dict) -> str:
-    """Return-path must mention the sender's domain, or it is a forgery signal."""
+    """Return-path must account for the sender's domain, or it is a forgery signal.
+
+    SRS-aware, which the prototype's plain substring test was not. All inbound
+    mail here arrives forwarded through the bridge, so the envelope return path
+    belongs to the *forwarder*, not the sender:
+
+        <owner+SRS=hash=DM=notify.bank.example=notices@forwarder.test>
+
+    A bare ``sender_domain in return_path`` check therefore failed for every
+    forwarded message and returned ``fail_critical``, which the level-2
+    assessment reads as grounds to reject. Level 3 was already SRS-aware; this
+    brings level 2 into line.
+
+    When the return path carries an ``SRS=`` token the original domain is
+    embedded in it, so the test is whether the sender's registrable domain
+    appears there -- subdomain-tolerant, since the envelope may name the parent
+    domain where the header names a subdomain, or the reverse. Without an
+    ``SRS=`` token nothing has been rewritten and the original direct-delivery
+    check stands.
+
+    TODO(srs): this looks for the domain anywhere in the SRS address rather than
+    decoding the token properly (SRS0/SRS1, hash, timestamp, then the original
+    domain and local part). Parsing it would let the check reject an address
+    that merely mentions the domain in the wrong field.
+    """
     sender_domain = context.get("senderDomain") or ""
     return_path = str(value or "")
-    if not sender_domain or sender_domain in return_path:
+
+    if not sender_domain:
         return "pass"
-    return "fail_critical"
+
+    if "SRS=" in return_path:
+        registrable = registrable_domain(sender_domain)
+        return "pass" if registrable and registrable in return_path else "fail_critical"
+
+    return "pass" if sender_domain in return_path else "fail_critical"
 
 
 def header_count_band(value: Any, message: dict, context: dict) -> str:

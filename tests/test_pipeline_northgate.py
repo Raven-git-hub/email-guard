@@ -35,12 +35,17 @@ def test_subdomain_sender_is_recognised_but_structurally_new(scan):
     """Domain recognised (greylist hit via subdomain), message shape not.
 
     Level reasoning: triage lands on 3 (greylisted domain, no matching
-    structure). The level-3 deep dive now scores a perfect profile -- the links
-    are on ``www.northgate-bank.example`` and ALIGN with the
+    structure). The level-3 deep dive scores a perfect profile -- the links are
+    on ``www.northgate-bank.example`` and ALIGN with the
     ``notify.northgate-bank.example`` sender, so ``content-links`` passes
     instead of returning ``fail_critical``. That promotes to level 4, where the
-    sender rule fails (Northgate is not one of the three major consumer
-    providers) and the corrected level-4 assessment downgrades to 3 for review.
+    sender rule now confirms the greylist membership that got the message here
+    (rather than demanding a major consumer provider, which no institution can
+    satisfy), the links come back clean, and the deep dive confirms level 4.
+
+    This is the first fixture that reaches ``cleared`` at all: before the
+    level-4 sender rule was replaced, every legitimate greylisted message was
+    downgraded to 3.
     """
     verdict = scan("json/northgate_1.json")
 
@@ -51,13 +56,14 @@ def test_subdomain_sender_is_recognised_but_structurally_new(scan):
     assert verdict["source_pipe"] == "OUTLOOK"
 
     assert verdict["initial_level"] == 3
-    assert verdict["final_level"] == 3
-    assert verdict["bucket"] == "flagged"
+    assert verdict["final_level"] == 4
+    assert verdict["bucket"] == "cleared"
 
     # The link fix at work: no critical link marker, so no escalation to 2.
     log = " | ".join(verdict["forensic_log"])
     assert "Critical markers found" not in log
     assert "Downgrading to Level 4" in log
+    assert "confirms legitimate service infrastructure" in log
 
     # Links still reach the verdict de-fanged and unclickable.
     assert verdict["links"]
@@ -72,7 +78,7 @@ def test_curly_apostrophe_subject_is_no_longer_obfuscation(scan):
     Punctuation, so the apostrophe read as homoglyph obfuscation, triage
     returned level 1, and a routine bank notification was rejected outright.
     With punctuation allowed it triages normally as a greylisted domain with an
-    uncatalogued structure, and settles at 3 like its sibling fixture.
+    uncatalogued structure, and now clears at level 4 like its sibling fixture.
     """
     verdict = scan("json/northgate_2.json")
 
@@ -87,8 +93,8 @@ def test_curly_apostrophe_subject_is_no_longer_obfuscation(scan):
     assert verdict["bucket"] != "rejected"
 
     assert verdict["initial_level"] == 3
-    assert verdict["final_level"] == 3
-    assert verdict["bucket"] == "flagged"
+    assert verdict["final_level"] == 4
+    assert verdict["bucket"] == "cleared"
 
     # No deep scan runs for a terminal level, so reaching level 4 proves triage
     # let the message through.
@@ -152,10 +158,70 @@ def test_canary_is_stubbed_and_gated_to_high_threat_levels(scan):
     }
 
     lower = scan("json/northgate_1.json")
-    assert lower["final_level"] == 3
+    assert lower["final_level"] == 4
     assert lower["canary"]["available"] is False
     assert lower["canary"]["reason"] == "not applicable at this level"
 
 
 def test_scan_is_deterministic(scan):
     assert scan("json/northgate_1.json") == scan("json/northgate_1.json")
+
+
+# --- fix A: the cleared path is reachable at all --------------------------------
+
+
+def test_greylisted_message_can_reach_cleared(scan):
+    """Regression for fix A: legitimate service mail is no longer stuck at flagged.
+
+    The level-4 sender rule used to pass only live/outlook/gmail senders, so any
+    greylisted institution failed it, the assessment read that as suspicious,
+    and the message was downgraded to 3. Nothing from a bank could ever clear.
+    The rule now confirms the trusted-list membership that admitted the message
+    to level 4 in the first place.
+    """
+    for fixture in ("json/northgate_1.json", "json/northgate_2.json"):
+        verdict = scan(fixture)
+        assert verdict["final_level"] == 4, fixture
+        assert verdict["bucket"] == "cleared", fixture
+        assert verdict["list_hits"]["greylist"] is True, fixture
+
+
+def test_clearing_still_requires_clean_links(scan):
+    """Fix A must not clear everything: off-domain links still keep a message flagged."""
+    verdict = scan("json/northgate_spoof.json")
+    assert verdict["final_level"] == 2
+    assert verdict["bucket"] == "flagged"
+
+
+def test_unlisted_sender_cannot_clear(scan):
+    """The defensive branch: reaching level 4 off-list must not clear.
+
+    ``simple.eml`` is from a domain on no list. Its level-3 profile scores well
+    enough to be promoted to 4, but the sender rule finds no list hit, so the
+    level-4 assessment downgrades it to 3 rather than clearing it.
+    """
+    verdict = scan("eml/simple.eml")
+    assert verdict["list_hits"] == {"whitelist": False, "greylist": False, "blacklist": False}
+    assert verdict["final_level"] == 3
+    assert verdict["bucket"] == "flagged"
+
+
+# --- fix B: SRS-forwarded mail survives the level-2 return-path check ------------
+
+
+def test_srs_forwarded_subdomain_sender_is_not_rejected(scan):
+    """Regression for fix B: a forwarded message must not be rejected outright.
+
+    The sender is ``payments@pay.northgate-bank.example`` while the SRS return
+    path embeds only the parent ``northgate-bank.example``. The old plain
+    substring test could not see through that, returned ``fail_critical``, and
+    the level-2 assessment rejected the message at level 1. Off-domain links
+    drive this fixture down to level 2 so the return-path rule actually runs.
+    """
+    verdict = scan("json/northgate_srs_subdomain.json")
+
+    assert verdict["sender"] == "payments@pay.northgate-bank.example"
+    assert verdict["final_level"] != 1
+    assert verdict["bucket"] != "rejected"
+    assert verdict["final_level"] == 2
+    assert verdict["bucket"] == "flagged"
