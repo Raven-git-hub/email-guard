@@ -6,8 +6,10 @@ index-based config paths". Everything is looked up by name.
 
 Resolution order, highest priority first:
 
-    1. explicit CLI flag (``--lists-dir`` / ``--rules-dir`` / ``--config``)
+    1. explicit CLI flag (``--lists-dir`` / ``--rules-dir`` / ``--outbound-dir``
+       / ``--daily-brief-dir`` / ``--config``)
     2. environment (``EMAIL_GUARD_LISTS_DIR`` / ``EMAIL_GUARD_RULES_DIR`` /
+       ``EMAIL_GUARD_OUTBOUND_DIR`` / ``EMAIL_GUARD_DAILY_BRIEF_DIR`` /
        ``EMAIL_GUARD_CONFIG``)
     3. ``config/config.json``
     4. built-in default
@@ -25,6 +27,10 @@ from pathlib import Path
 
 DEFAULT_LISTS_DIR = "data/lists"
 DEFAULT_RULES_DIR = "rules"
+# Runtime output stores. Both hold personal data (whole messages, sender
+# addresses) and are git-ignored -- root README, "Storage & privacy".
+DEFAULT_OUTBOUND_DIR = "data/outbound"
+DEFAULT_DAILY_BRIEF_DIR = "data/daily-brief"
 
 
 def project_root() -> Path:
@@ -40,6 +46,8 @@ def default_config_path() -> Path:
 class Config:
     lists_dir: Path
     rules_dir: Path
+    outbound_dir: Path
+    daily_brief_dir: Path
     config_path: Path | None
 
 
@@ -47,6 +55,8 @@ def load(
     config_path: str | os.PathLike[str] | None = None,
     lists_dir: str | os.PathLike[str] | None = None,
     rules_dir: str | os.PathLike[str] | None = None,
+    outbound_dir: str | os.PathLike[str] | None = None,
+    daily_brief_dir: str | os.PathLike[str] | None = None,
 ) -> Config:
     """Build the effective configuration from flags, environment and file."""
     chosen_config = config_path or os.environ.get("EMAIL_GUARD_CONFIG")
@@ -81,7 +91,27 @@ def load(
         DEFAULT_RULES_DIR,
         base,
     )
-    return Config(lists_dir=resolved_lists, rules_dir=resolved_rules, config_path=used_path)
+    resolved_outbound = _resolve(
+        outbound_dir,
+        os.environ.get("EMAIL_GUARD_OUTBOUND_DIR"),
+        data.get("outbound_dir"),
+        DEFAULT_OUTBOUND_DIR,
+        base,
+    )
+    resolved_daily_brief = _resolve(
+        daily_brief_dir,
+        os.environ.get("EMAIL_GUARD_DAILY_BRIEF_DIR"),
+        data.get("daily_brief_dir"),
+        DEFAULT_DAILY_BRIEF_DIR,
+        base,
+    )
+    return Config(
+        lists_dir=resolved_lists,
+        rules_dir=resolved_rules,
+        outbound_dir=resolved_outbound,
+        daily_brief_dir=resolved_daily_brief,
+        config_path=used_path,
+    )
 
 
 def _resolve(flag, env, from_file, fallback, base: Path) -> Path:

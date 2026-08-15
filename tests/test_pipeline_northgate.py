@@ -28,6 +28,7 @@ VERDICT_KEYS = {
     "canary",
     "proposed_action",
     "proposal",
+    "written",
 }
 
 

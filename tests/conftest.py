@@ -3,6 +3,11 @@
 Every test runs offline against SYNTHETIC list fixtures in
 ``tests/fixtures/lists/`` -- never the live lists, which are personal data and
 git-ignored (root README, "Storage & privacy").
+
+The same rule applies to the output stage: tests write into pytest ``tmp_path``
+directories, never into the repo's ``data/outbound`` or ``data/daily-brief``.
+:func:`repo_data_stays_empty` enforces that, so a test that forgets to pass its
+output directories fails loudly instead of quietly filling the working tree.
 """
 
 from __future__ import annotations
@@ -28,6 +33,29 @@ RULES_DIR = PROJECT_ROOT / "rules"
 # reach its validator the same way the engine does.
 _rules_validate = load_module_from_path(RULES_DIR / "validate.py", "_test_rules_validate")
 validate_pack = _rules_validate.validate_pack
+
+
+OUTPUT_DIRS = (PROJECT_ROOT / "data" / "outbound", PROJECT_ROOT / "data" / "daily-brief")
+
+
+@pytest.fixture(autouse=True)
+def repo_data_stays_empty():
+    """Fail any test that writes into the repo's real output directories."""
+    before = _output_contents()
+    yield
+    assert _output_contents() == before, (
+        "a test wrote into the repo's data/ directories -- pass tmp_path-based "
+        "--outbound-dir / --daily-brief-dir instead"
+    )
+
+
+def _output_contents() -> set[str]:
+    return {
+        str(path)
+        for directory in OUTPUT_DIRS
+        for path in directory.rglob("*")
+        if path.name != ".gitkeep"
+    }
 
 
 @pytest.fixture(scope="session")

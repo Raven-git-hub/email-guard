@@ -2,9 +2,13 @@
 data/lists/*.json
 !data/lists/*.sample.json
 
-# Runtime data written by later components (dispatcher, applier, UI)
-data/daily-brief/
-data/outbound/
+# Runtime data written by the scanner's output stage (routed messages and
+# their reports, staged candidates). Personal data; the directories themselves
+# are kept so a clean clone can run without creating them.
+data/daily-brief/**
+!data/daily-brief/.gitkeep
+data/outbound/**
+!data/outbound/.gitkeep
 
 # --- Python ---
 __pycache__/

@@ -45,4 +45,7 @@ def build_verdict(
         # webhook. Not yet in the greylist schema -- root README, "Actions".
         "proposed_action": None,
         "proposal": proposal,
+        # Filled in by the output stage with the paths it created; stays null
+        # for a pure verdict (`--dry-run`, or a caller using the library form).
+        "written": None,
     }

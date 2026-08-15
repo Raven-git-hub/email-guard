@@ -152,7 +152,11 @@ def test_all_three_cleaners_emit_the_identical_shape(lists):
 
 
 def test_cli_json_output_matches_the_library(pack, lists, capsys):
-    """The CLI is a thin wrapper: same verdict either way."""
+    """The CLI is a thin wrapper: same verdict either way.
+
+    ``--dry-run`` keeps this test on the verdict alone -- the CLI's writing is
+    covered in ``tests/test_write.py``, against tmp directories.
+    """
     from email_guard.cli import main
     import json
 
@@ -165,6 +169,7 @@ def test_cli_json_output_matches_the_library(pack, lists, capsys):
             str(LIST_FIXTURES),
             "--job-id",
             "test-job",
+            "--dry-run",
         ]
     )
     assert exit_code == 0

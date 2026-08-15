@@ -1,4 +1,6 @@
 {
   "lists_dir": "data/lists",
-  "rules_dir": "rules"
+  "rules_dir": "rules",
+  "outbound_dir": "data/outbound",
+  "daily_brief_dir": "data/daily-brief"
 }

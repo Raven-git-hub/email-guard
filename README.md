@@ -61,7 +61,8 @@ The rules pack contains:
 | Prompt-injection signature DB | **Does not exist yet** — starts empty, grows over time |
 | Docker dispatcher + scanner | **To be built** |
 | Canary (local LLM) semantic checks | **To be built** |
-| Candidate generation + daily review | Exists over Discord (clunky); to move into the UI |
+| Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
+| Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; review UI + applier to be built |
 | Webhook / output sinks + actions | Partially proven; actions not yet in the greylist schema |
 | Admin UI (lists, stats, quarantine, review, approvals) | **To be built** |
 | Unified configuration | **To be built** (replaces conflicting path files + index refs) |
@@ -210,6 +211,65 @@ to cleared.
 | **5** | Trusted whitelist (no attachments) | `cleared` |
 
 `cleared` → consolidated inbox (tagged with an action); `flagged`/`rejected` → quarantine.
+
+---
+
+## Scanner outputs
+
+A scan **writes**. Printing the verdict is the `--dry-run` behaviour; by default the
+scanner persists three things.
+
+```
+data/outbound/<bucket>/<job>/report.json    # the full verdict
+data/outbound/<bucket>/<job>/message.eml    # the original, byte for byte
+                        ... /message.json   # ... or the --from-json input
+data/daily-brief/daily-brief-<YYYY-MM-DD>/<job>/candidate.json
+```
+
+- `<bucket>` is `cleared` / `flagged` / `rejected`, from the level (see above).
+- `<job>` is a filesystem-safe slug of the message id — angle brackets stripped, unsafe
+  characters replaced, over-long ids truncated with a hash suffix. A message with no usable
+  id falls back to a short hash **of its own bytes**, so it still gets a stable directory of
+  its own.
+- The stored message is a **verbatim copy**, never a re-serialisation of the parsed form:
+  quarantine is forensic storage, so what the scanner saw is what a reviewer reads.
+- The verdict gains a `written` section naming every path created; it is `null` under
+  `--dry-run`.
+- Re-scanning the same message with the same date **overwrites its own files identically** —
+  no timestamps, no run ids, fixed JSON formatting.
+
+A `candidate.json` is staged only for `unknown_domain` (sender on no list) and
+`new_structure` (greylisted domain, uncatalogued shape). `skip` writes nothing, and
+**nothing here ever edits the live lists** — a candidate carries `proposed_entries`, each a
+complete schema-shaped list entry plus the `list` it would join and the `operation` needed.
+They are alternatives: the reviewer picks at most one, and only the applier writes lists.
+A proposed structure is deliberately over-specific (it is drafted from one sample); the
+review UI is where a human generalises it.
+
+The daily-brief date is **injected, never read from the clock** inside the logic — `--now
+YYYY-MM-DD` pins it, defaulting to today — so a run is reproducible and testable.
+
+### CLI
+
+```
+python -m email_guard message.eml
+python -m email_guard --from-json sample.json --pretty
+python -m email_guard --from-json sample.json --dry-run       # compute, print, write nothing
+python -m email_guard --validate-rules
+```
+
+Paths resolve by **flag > environment > `config/config.json` > built-in default**:
+
+| Setting | Flag | Environment | Default |
+|---------|------|-------------|---------|
+| Live lists | `--lists-dir` | `EMAIL_GUARD_LISTS_DIR` | `data/lists` |
+| Rules pack | `--rules-dir` | `EMAIL_GUARD_RULES_DIR` | `rules` |
+| Routed output | `--outbound-dir` | `EMAIL_GUARD_OUTBOUND_DIR` | `data/outbound` |
+| Staged candidates | `--daily-brief-dir` | `EMAIL_GUARD_DAILY_BRIEF_DIR` | `data/daily-brief` |
+| Config file | `--config` | `EMAIL_GUARD_CONFIG` | `config/config.json` |
+
+Both output stores hold personal data (whole messages, real senders) and are git-ignored;
+the repo ships only the empty directories.
 
 ---
 
@@ -363,7 +423,8 @@ email-guard/
 7. Containerise the scanner (`--rm`); test offline against saved messages.
 8. Build the dispatcher (IMAP `IDLE` → spawn) with concurrency + webhook delivery.
 9. Formalise output sinks and the **action** payload; add `action` to the greylist schema.
-10. Build the candidate → daily-brief → review → applier loop, and the Admin UI.
+10. Build the review → applier half of the learning loop, and the Admin UI (the scanner
+    already stages candidates into `daily-brief-{date}/`).
 11. Wire up consolidated-inbox delivery for `cleared` mail.
 12. Seed the prompt-injection signature DB (Canary-assisted) as real traffic is seen.
 13. Fix the known issues; add a regression corpus of real sample messages.
