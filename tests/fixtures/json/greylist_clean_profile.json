@@ -1,0 +1,35 @@
+{
+  "_fixture_note": "SYNTHETIC message (fake sender, fake recipient). Built to drive the level-4 path: greylisted domain with no matching structure -> triage 3; a perfect level-3 confidence profile (transactional Ref, aligned DKIM, SER- mailer, no links) -> assessed up to 4; then the level-4 sender rule fails on a non-major-provider domain -> downgraded to 3. Locks in the level-5 inversion fix on a full pipeline run.",
+  "textHtml": "<html><body><p>Dear Customer,</p><p>Thank you for your recent transaction. The details are recorded below for your records.</p><p>Amount: 42.00<br>Posted: 2026-05-15</p><p>This is a servicing message. No reply is needed.</p></body></html>",
+  "textPlain": "",
+  "metadata": {
+    "content-transfer-encoding": "quoted-printable",
+    "content-type": "text/html; charset=utf-8",
+    "x-pm-date": "Fri, 15 May 2026 09:00:00 +0000",
+    "reply-to": "\"Quiet Service\" <notices@quietservice.example>",
+    "return-path": "<owner+SRS=abc12=DM=quietservice.example=notices@example.net>",
+    "x-original-to": "owner@example.com",
+    "delivered-to": "owner@example.com",
+    "authentication-results": "mail.bridge.example; dkim=pass (Good 2048 bit rsa-sha256 signature) header.d=quietservice.example header.a=rsa-sha256",
+    "received": "from mta03.outbound.example.net (mta03.outbound.example.net [192.0.2.27]) by mailin050.bridge.example (Postfix) with ESMTPS id 4gH7216FPcz46 for <owner@example.com>; Fri, 15 May 2026 09:00:00 +0000 (UTC)",
+    "resent-from": "<owner@example.net>",
+    "dkim-signature": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=quietservice.example; s=sel01; bh=trimmed; b=trimmed",
+    "x-mailer": "SER-9f2c4a1b7e6d3c8a5b0f2e9d4c7a1b6e3f8d2c5a9b4e7f1c6a3d8b5e2f9c4a7b",
+    "message-id": "<a1b2c3d4-0000-4444-8888-99887766aabb@quietservice.example>",
+    "mime-version": "1.0",
+    "x-incomingheadercount": "17",
+    "x-ms-publictraffictype": "Email",
+    "x-ms-office365-filtering-correlation-id": "00000000-1111-2222-3333-444444444444",
+    "x-sender-ip": "203.0.113.12",
+    "x-sid-result": "PASS",
+    "x-pm-origin": "external",
+    "x-pm-spamscore": "0"
+  },
+  "attributes": {
+    "uid": 9001
+  },
+  "to": "<OWNER@EXAMPLE.COM>",
+  "from": "\"Quiet Service\" <notices@quietservice.example>",
+  "subject": "Transaction recorded Ref:[QS4471209]",
+  "date": "Fri, 15 May 2026 09:00:00 +0000"
+}

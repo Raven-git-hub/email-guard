@@ -1,0 +1,25 @@
+{
+  "greylist": [
+    {
+      "domain": "northgate-bank.example",
+      "known_structures": [
+        {
+          "name": "Statement Ready Notice",
+          "key_phrases": [
+            "Subject: Your statement is ready",
+            "your monthly statement is now available"
+          ]
+        }
+      ]
+    },
+    {
+      "domain": "shopfast.example",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

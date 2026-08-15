@@ -1,0 +1,43 @@
+{
+  "_note": "SYNTHETIC test fixture -- invented senders only. The repeated `noreply@spammy.example` entry is deliberate: it exercises dedupe-on-load (root README, Known issues -> Data hygiene). `both@conflict.example` also appears on the whitelist, to lock list precedence.",
+  "blacklist": [
+    {
+      "email": "scam@phisher.example",
+      "friendly_name": "Bad Actor",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    },
+    {
+      "email": "noreply@spammy.example",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    },
+    {
+      "email": "noreply@spammy.example",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    },
+    {
+      "email": "both@conflict.example",
+      "friendly_name": "Listed Twice (blacklist side)",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

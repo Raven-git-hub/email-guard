@@ -1,0 +1,43 @@
+{
+  "_fixture_note": "SYNTHETIC phishing-shaped message -- invented throughout. Claims the Northgate Bank sender domain but every link points at an unrelated host. Before the link fix this was indistinguishable from the legitimate fixtures (all links failed alignment regardless); now the misalignment is real signal and the level-3 assessment escalates on it.",
+  "textHtml": "<html><body><p>Dear Customer,</p><p>A payment on your account could not be completed. Review the details at the link below.</p><p><a href=\"https://northgate-verify.example/account/\">Review your account</a></p><p>Copyright Northgate Bank 2026.</p></body></html>",
+  "textPlain": "",
+  "metadata": {
+    "content-transfer-encoding": "quoted-printable",
+    "content-type": "text/html; charset=utf-8",
+    "x-pm-date": "Fri, 15 May 2026 13:14:01 +0000",
+    "reply-to": "\"Northgate Bank\" <notifications@notify.northgate-bank.example>",
+    "return-path": "<owner+SRS=pH4K1=DM=notify.northgate-bank.example=notifications@example.net>",
+    "x-original-to": "owner@example.com",
+    "delivered-to": "owner@example.com",
+    "authentication-results": "mail.bridge.example; dkim=pass (Good 2048 bit rsa-sha256 signature) header.d=northgate-bank.example header.a=rsa-sha256",
+    "received": "from mta01.outbound.example.net (mta01.outbound.example.net [192.0.2.25]) by mailin050.bridge.example (Postfix) with ESMTPS id 4gH7216FPcz46 for <owner@example.com>; Fri, 15 May 2026 13:14:01 +0000 (UTC)",
+    "resent-from": "<owner@example.net>",
+    "received-spf": "Pass (protection.example.net: domain of notify.northgate-bank.example designates 203.0.113.10 as permitted sender) receiver=protection.example.net; client-ip=203.0.113.10; helo=mx07.mail.example.net; pr=C",
+    "dkim-signature": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=northgate-bank.example; s=sel-2026; bh=REDACTED; b=REDACTED",
+    "x-mailer": "SER-3b2d5ad16109b85a2bd7a8748c9f0e1080c4fc729be4b66b02080f3ae63238f5",
+    "message-id": "<f00dcafe-1111-4222-8333-444455556666@notify.northgate-bank.example>",
+    "mime-version": "1.0",
+    "x-iccategory": "3",
+    "x-incomingheadercount": "17",
+    "x-ms-publictraffictype": "Email",
+    "x-ms-office365-filtering-correlation-id": "9e7c1a22-4b33-4c55-8d77-08deb283dfff",
+    "x-sender-ip": "203.0.113.10",
+    "x-sid-pra": "NOTIFICATIONS@NOTIFY.NORTHGATE-BANK.EXAMPLE",
+    "x-sid-result": "PASS",
+    "x-ms-exchange-crosstenant-id": "84df9e7f-e9f6-40af-b435-aaaaaaaaaaaa",
+    "x-originatororg": "mail.example.net",
+    "x-pm-origin": "external",
+    "x-pm-transfer-encryption": "TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits)",
+    "x-pm-content-encryption": "on-delivery",
+    "x-pm-spamscore": "0",
+    "x-pm-spam-action": "inbox"
+  },
+  "attributes": {
+    "uid": 1334
+  },
+  "to": "<OWNER@EXAMPLE.COM>",
+  "from": "\"Northgate Bank\" <notifications@notify.northgate-bank.example>",
+  "subject": "Payment sent Ref:[NB4471299]",
+  "date": "Fri, 15 May 2026 13:13:51 +0000"
+}

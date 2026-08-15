@@ -1,0 +1,18 @@
+# --- Live list data: personal, never committed (see README "Storage & privacy") ---
+data/lists/*.json
+!data/lists/*.sample.json
+
+# Runtime data written by later components (dispatcher, applier, UI)
+data/daily-brief/
+data/outbound/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/

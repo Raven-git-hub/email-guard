@@ -1,0 +1,43 @@
+{
+  "_fixture_note": "SYNTHETIC message -- invented sender, recipient, IDs and TEST-NET IPs; no real data. Shape modelled on a forwarded bank notification so it exercises the same paths the prototype's captured samples did. Covers: OUTLOOK pipe detection (x-ms-* present), dkim=pass with header.d=northgate-bank.example, greylist SUBDOMAIN hit (notify.northgate-bank.example -> northgate-bank.example), a subject matching no known structure (new_structure), and on-domain links that must ALIGN now that link rules see real hosts.",
+  "textHtml": "<html><body><p style=\"color:#0b4f6c;font-size:18px;\">Payment sent</p><p>Dear Customer,</p><p>Thank you for using our payment services. Your payment has been sent to the payee account. The details are below:</p><p>Payment date: 2026-05-15<br>Payee account: 7962XXX883<br>Payment amount: 2,600.00<br>Debit account no.: 4847XXX-XXX</p><p>This is a servicing email from Northgate Bank. We will never link you directly to a web page or form asking you to enter your user ID, password or account numbers.</p><p><a href=\"https://www.northgate-bank.example/privacy-security/\">Privacy and Security</a> | <a href=\"https://www.northgate-bank.example/terms-of-use/\">Terms of Use</a></p><p>Copyright Northgate Bank 2026. All rights reserved.</p></body></html>",
+  "textPlain": "",
+  "metadata": {
+    "content-transfer-encoding": "quoted-printable",
+    "content-type": "text/html; charset=utf-8",
+    "x-pm-date": "Fri, 15 May 2026 13:14:01 +0000",
+    "reply-to": "\"Northgate Bank\" <notifications@notify.northgate-bank.example>",
+    "return-path": "<owner+SRS=pH4K1=DM=notify.northgate-bank.example=notifications@example.net>",
+    "x-original-to": "owner@example.com",
+    "delivered-to": "owner@example.com",
+    "authentication-results": "mail.bridge.example; dkim=pass (Good 2048 bit rsa-sha256 signature) header.d=northgate-bank.example header.a=rsa-sha256",
+    "received": "from mta01.outbound.example.net (mta01.outbound.example.net [192.0.2.25]) by mailin050.bridge.example (Postfix) with ESMTPS id 4gH7216FPcz46 for <owner@example.com>; Fri, 15 May 2026 13:14:01 +0000 (UTC)",
+    "resent-from": "<owner@example.net>",
+    "received-spf": "Pass (protection.example.net: domain of notify.northgate-bank.example designates 203.0.113.10 as permitted sender) receiver=protection.example.net; client-ip=203.0.113.10; helo=mx07.mail.example.net; pr=C",
+    "dkim-signature": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=northgate-bank.example; s=sel-2026; bh=REDACTED; b=REDACTED",
+    "x-mailer": "SER-3b2d5ad16109b85a2bd7a8748c9f0e1080c4fc729be4b66b02080f3ae63238f5",
+    "message-id": "<26870113-1ed5-40c7-85c4-fcc190ad575d@notify.northgate-bank.example>",
+    "mime-version": "1.0",
+    "x-iccategory": "3",
+    "x-incomingheadercount": "17",
+    "x-ms-publictraffictype": "Email",
+    "x-ms-office365-filtering-correlation-id": "4a83660d-de97-4574-89d1-08deb283d0b7",
+    "x-sender-ip": "203.0.113.10",
+    "x-sid-pra": "NOTIFICATIONS@NOTIFY.NORTHGATE-BANK.EXAMPLE",
+    "x-sid-result": "PASS",
+    "x-ms-exchange-crosstenant-id": "84df9e7f-e9f6-40af-b435-aaaaaaaaaaaa",
+    "x-originatororg": "mail.example.net",
+    "x-pm-origin": "external",
+    "x-pm-transfer-encryption": "TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits)",
+    "x-pm-content-encryption": "on-delivery",
+    "x-pm-spamscore": "0",
+    "x-pm-spam-action": "inbox"
+  },
+  "attributes": {
+    "uid": 1332
+  },
+  "to": "<OWNER@EXAMPLE.COM>",
+  "from": "\"Northgate Bank\" <notifications@notify.northgate-bank.example>",
+  "subject": "Payment sent Ref:[NB4471209]",
+  "date": "Fri, 15 May 2026 13:13:51 +0000"
+}

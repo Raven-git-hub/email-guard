@@ -1,0 +1,3 @@
+# Live lists (whitelist.json / greylist.json / blacklist.json) are host-provided and
+# git-ignored — see README "Storage & privacy". Copy a *.sample.json to the matching
+# *.json to get started. The scanner runs with these files absent (empty lists).

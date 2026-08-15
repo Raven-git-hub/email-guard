@@ -1,0 +1,58 @@
+{
+  "_note": "SYNTHETIC test fixture -- fully invented senders on reserved .example domains. Never the live lists. Covers every greylist branch: structures with a Subject: phrase, a named ALL EMAILS match-all, a named structure with empty key_phrases, and a domain with no structures at all.",
+  "greylist": [
+    {
+      "domain": "northgate-bank.example",
+      "known_structures": [
+        {
+          "name": "Northgate Statement Ready",
+          "key_phrases": [
+            "Subject: Your statement is ready",
+            "your monthly statement is now available"
+          ]
+        },
+        {
+          "name": "Northgate Fund Transfer Advice",
+          "key_phrases": [
+            "Subject: Fund transfer advice",
+            "we have credited your account"
+          ]
+        }
+      ]
+    },
+    {
+      "domain": "shopfast.example",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    },
+    {
+      "domain": "mailings.example",
+      "known_structures": [
+        {
+          "name": "Anything At All",
+          "key_phrases": []
+        }
+      ]
+    },
+    {
+      "domain": "oldforum.example",
+      "known_structures": []
+    },
+    {
+      "domain": "quietservice.example",
+      "known_structures": [
+        {
+          "name": "Quiet Service Receipt",
+          "key_phrases": [
+            "Subject: Your receipt",
+            "thank you for your order"
+          ]
+        }
+      ]
+    }
+  ]
+}

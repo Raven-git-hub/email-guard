@@ -1,0 +1,26 @@
+Return-Path: <sam@unknown-sender.example>
+Delivered-To: owner@example.com
+From: "Sam Example" <sam@unknown-sender.example>
+To: "Inbox" <owner@example.com>
+Subject: Project notes for Thursday
+Date: Fri, 15 May 2026 09:30:00 +0000
+Message-ID: <plain-0001@unknown-sender.example>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="boundary42"
+
+--boundary42
+Content-Type: text/plain; charset=utf-8
+
+Hi there,
+
+Notes from the meeting are online at https://notes.unknown-sender.example/thursday
+
+Sam
+
+--boundary42
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>Hi there,</p><p>Notes from the meeting are online at
+<a href="https://notes.unknown-sender.example/thursday">this page</a>.</p><p>Sam</p></body></html>
+
+--boundary42--

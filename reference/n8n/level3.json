@@ -1,0 +1,106 @@
+[
+  {
+    "scan_type": "core-original_sender",
+    "logic": "const parts = content.split('@'); context.senderDomain = parts[1] ? parts[1].toLowerCase() : ''; return { status: 'pass' };"
+  },
+  {
+    "scan_type": "core-title",
+    "logic": "const isTransactional = /Ref:\\[[A-Z0-9]+\\]/i.test(content); const status = isTransactional ? 'pass_service' : 'pass'; return { status: status };"
+  },
+  {
+    "scan_type": "core-clean_text",
+    "logic": "const hasDisclaimer = /never contact you.*validate personal information/i.test(content); const hasRef = /Ref:\\[[A-Z0-9]+\\]/i.test(content); const hasGenericPhone = /\\(\\d{2,3}\\)\\s\\d{4,}/.test(content); const status = (hasDisclaimer && hasRef && hasGenericPhone) ? 'pass_service' : 'pass'; return { status: status };"
+  },
+  {
+    "scan_type": "core-attachments",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "core-links",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-dmarc",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-dkim",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-spf",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-auth_string",
+    "logic": "const dkimMatch = content.match(/header\\.d=([a-z0-9.-]+)/i); const signingDomain = dkimMatch ? dkimMatch[1].toLowerCase() : ''; const returnPath = context.report?.messageContent?.metadata?.path?.return_path || ''; const isAligned = returnPath.includes(signingDomain) || signingDomain.endsWith('.com') || signingDomain.endsWith('.net'); return { status: isAligned ? 'pass_service' : 'fail_critical' };"
+  },
+  {
+    "scan_type": "metadata-origin-ip",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-origin-sid_result",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-path-return_path",
+    "logic": "const isSRS = content.includes('SRS='); return { status: isSRS ? 'pass_service' : 'pass' };"
+  },
+  {
+    "scan_type": "metadata-path-is_forwarded",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-path-hop_count",
+    "logic": "const returnPath = context.report?.messageContent?.metadata?.path?.return_path || ''; const isSRS = returnPath.includes('SRS='); return { status: (content > 5 && !isSRS) ? 'fail_critical' : 'pass' };"
+  },
+  {
+    "scan_type": "metadata-technical-content_type",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-is_multipart",
+    "logic": "return { status: (content === true) ? 'pass_service' : 'pass' };"
+  },
+  {
+    "scan_type": "metadata-technical-encoding",
+    "logic": "const isSuspicious = content.includes('base64'); return { status: isSuspicious ? 'fail_spam' : 'pass' };"
+  },
+  {
+    "scan_type": "metadata-technical-mime_version",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-behavioural-header_count",
+    "logic": "return { status: (content > 35) ? 'pass_service' : 'pass' };"
+  },
+  {
+    "scan_type": "metadata-behavioural-mailer",
+    "logic": "const isSystemHash = /^SER-[a-f0-9]+/.test(content); return { status: isSystemHash ? 'pass_service' : 'fail_spam' };"
+  },
+  {
+    "scan_type": "metadata-behavioural-traffic_type",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "integrity-dkim_verified",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "integrity-source_pipe",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "content-links",
+    "logic": "if (!Array.isArray(content) || content.length === 0) { return { status: 'pass' }; } const returnPath = context.report?.messageContent?.metadata?.path?.return_path || ''; const domainMatch = returnPath.match(/@([a-z0-9.-]+)/i); const rootDomain = domainMatch ? domainMatch[1].split('.').slice(-2).join('.') : ''; const domains = content.map(l => { try { return new URL(l).hostname.toLowerCase(); } catch(e) { return ''; } }); const isAligned = domains.every(d => rootDomain !== '' && d.includes(rootDomain)); return { status: isAligned ? 'pass_service' : 'fail_critical' };"
+  },
+  {
+    "scan_type": "content-attachments",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "content-text",
+    "logic": "ignore"
+  }
+]

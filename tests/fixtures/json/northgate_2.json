@@ -1,0 +1,43 @@
+{
+  "_fixture_note": "SYNTHETIC message -- invented sender, recipient, IDs and TEST-NET IPs; no real data. Exact-domain greylist hit on northgate-bank.example (not a subdomain, unlike northgate_1). Its subject carries a curly apostrophe (U+2019) and is the regression fixture for the visual-obfuscation fix: ordinary typography must no longer read as homoglyph obfuscation.",
+  "textHtml": "<html><body><p style=\"color:#0b4f6c;font-size:18px;\">We’ve added a payee</p><p>Dear Customer</p><p>We’ve added 7962XXX883 “BRIGHT K*** M* W** L******” to your payee list, and set the daily transfer limit to 50,000. If successful, it takes effect on the next business day.</p><p>Need help? You can reach us through “Chat with us” in the Northgate Bank app — or by phone.</p><p>This is a servicing email from Northgate Bank. We will never link you directly to a web page or form asking you to enter your user ID, password or account numbers.</p><p><a href=\"https://www.northgate-bank.example/payees/\">Manage payees</a></p><p>Copyright Northgate Bank 2026. All rights reserved.</p></body></html>",
+  "textPlain": "",
+  "metadata": {
+    "content-transfer-encoding": "quoted-printable",
+    "content-type": "text/html; charset=utf-8",
+    "x-pm-date": "Fri, 15 May 2026 13:14:04 +0000",
+    "reply-to": "\"Northgate Bank\" <payments@pay.northgate-bank.example>",
+    "return-path": "<owner+SRS=7AqCh=DM=northgate-bank.example=payments@example.net>",
+    "x-original-to": "owner@example.com",
+    "delivered-to": "owner@example.com",
+    "authentication-results": "mail.bridge.example; dkim=pass (Good 2048 bit rsa-sha256 signature) header.d=northgate-bank.example header.a=rsa-sha256",
+    "received": "from mta02.outbound.example.net (mta02.outbound.example.net [192.0.2.26]) by mailin050.bridge.example (Postfix) with ESMTPS id 4gH7246nS6z4j for <owner@example.com>; Fri, 15 May 2026 13:14:04 +0000 (UTC)",
+    "resent-from": "<owner@example.net>",
+    "received-spf": "Pass (protection.example.net: domain of northgate-bank.example designates 203.0.113.11 as permitted sender) receiver=protection.example.net; client-ip=203.0.113.11; helo=mx07.mail.example.net; pr=C",
+    "dkim-signature": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=northgate-bank.example; s=sel-2026; bh=REDACTED; b=REDACTED",
+    "x-mailer": "SER-3b2d5ad16109b85a2bd7a8748c9f0e1080c4fc729be4b66b02080f3ae63238f5",
+    "message-id": "<d614579c-77d0-4f9a-92c7-55aa39cdc8bc@pay.northgate-bank.example>",
+    "mime-version": "1.0",
+    "x-iccategory": "3",
+    "x-incomingheadercount": "17",
+    "x-ms-publictraffictype": "Email",
+    "x-ms-office365-filtering-correlation-id": "01d558f0-dd21-4960-8486-08deb283d1ef",
+    "x-sender-ip": "203.0.113.11",
+    "x-sid-pra": "PAYMENTS@PAY.NORTHGATE-BANK.EXAMPLE",
+    "x-sid-result": "PASS",
+    "x-ms-exchange-crosstenant-id": "84df9e7f-e9f6-40af-b435-aaaaaaaaaaaa",
+    "x-originatororg": "mail.example.net",
+    "x-pm-origin": "external",
+    "x-pm-transfer-encryption": "TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits)",
+    "x-pm-content-encryption": "on-delivery",
+    "x-pm-spamscore": "0",
+    "x-pm-spam-action": "inbox"
+  },
+  "attributes": {
+    "uid": 1333
+  },
+  "to": "<OWNER@EXAMPLE.COM>",
+  "from": "\"Northgate Bank\" <payments@pay.northgate-bank.example>",
+  "subject": "We’ve added a payee Ref:[NB4471221]",
+  "date": "Fri, 15 May 2026 13:13:53 +0000"
+}

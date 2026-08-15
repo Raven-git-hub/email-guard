@@ -1,0 +1,14 @@
+{
+  "whitelist": [
+    {
+      "email": "friend@example.org",
+      "friendly_name": "Trusted Friend",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

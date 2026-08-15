@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "description": "Prompt-injection signature database. Starts empty by design and grows as real traffic is seen (Canary-assisted) -- root README, Status + Roadmap step 12.",
+  "signatures": []
+}

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "email-guard-scanner"
+version = "0.1.0"
+description = "Email Guard scanner: one raw message + a rules pack in, a structured verdict out."
+requires-python = ">=3.11"
+# Deliberately zero runtime dependencies: the scanner parses mail with the
+# stdlib `email` package and must run offline inside a throwaway container.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+email-guard = "email_guard.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "scanner" }
+
+[tool.setuptools.packages.find]
+where = ["scanner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

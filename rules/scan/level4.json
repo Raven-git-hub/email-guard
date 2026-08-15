@@ -1,0 +1,50 @@
+[
+  {
+    "field": "core-original_sender",
+    "type": "func",
+    "func": "level4_funcs.major_provider_sender",
+    "comment": "TODO(tuning): this only passes live.com / outlook.com / gmail.com senders, so a legitimate greylisted institution reads as suspicious and gets flagged by the level-4 assessment. Prototype logic-quality issue; revisit with a regression corpus."
+  },
+  { "field": "core-title", "type": "ignore" },
+  { "field": "core-clean_text", "type": "ignore" },
+  { "field": "core-attachments", "type": "ignore" },
+  { "field": "core-links", "type": "ignore" },
+
+  { "field": "metadata-authenticity-dmarc", "type": "ignore" },
+  { "field": "metadata-authenticity-dkim", "type": "ignore" },
+  { "field": "metadata-authenticity-spf", "type": "ignore" },
+  { "field": "metadata-authenticity-auth_string", "type": "ignore" },
+
+  { "field": "metadata-origin-ip", "type": "ignore" },
+  { "field": "metadata-origin-sid_result", "type": "ignore" },
+
+  { "field": "metadata-path-return_path", "type": "ignore" },
+  { "field": "metadata-path-is_forwarded", "type": "ignore" },
+  { "field": "metadata-path-hop_count", "type": "ignore" },
+
+  { "field": "metadata-technical-content_type", "type": "ignore" },
+  { "field": "metadata-technical-is_multipart", "type": "ignore" },
+  { "field": "metadata-technical-encoding", "type": "ignore" },
+  { "field": "metadata-technical-mime_version", "type": "ignore" },
+
+  { "field": "metadata-behavioural-header_count", "type": "ignore" },
+  { "field": "metadata-behavioural-mailer", "type": "ignore" },
+  { "field": "metadata-behavioural-traffic_type", "type": "ignore" },
+
+  { "field": "integrity-dkim_verified", "type": "ignore" },
+  { "field": "integrity-source_pipe", "type": "ignore" },
+
+  {
+    "field": "content-links",
+    "type": "func",
+    "func": "level4_funcs.shortener_links",
+    "comment": "Was a declarative regex over the de-fanged link strings, which could never match; now matches known shorteners against the real host."
+  },
+  { "field": "content-attachments", "type": "ignore" },
+  { "field": "content-text", "type": "ignore" },
+  {
+    "field": "content-timestamp",
+    "type": "ignore",
+    "comment": "Not in the prototype's scan-item list; declared explicitly so no scan point falls through as 'unknown'."
+  }
+]

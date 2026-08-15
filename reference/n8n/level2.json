@@ -1,0 +1,106 @@
+[
+  {
+    "scan_type": "core-original_sender",
+    "logic": "const parts = content.split('@'); context.senderDomain = parts[1] ? parts[1].toLowerCase() : ''; context.originalSender = content; context.results = context.results || {}; return { status: 'pass' };"
+  },
+  {
+    "scan_type": "core-title",
+    "logic": "context.results = context.results || {}; const urgency = [/urgent/i, /action required/i, /payment/i, /alert/i, /notification/i]; const status = urgency.some(p => p.test(content)) ? 'fail_pass' : 'pass'; context.results['core-title'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "core-clean_text",
+    "logic": "context.results = context.results || {}; const cta = [/verify/i, /login/i, /update/i, /confirm/i, /click/i]; const hits = cta.filter(p => p.test(content)); const status = hits.length > 0 ? 'fail_pass' : 'pass'; context.results['core-clean_text'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "core-attachments",
+    "logic": "context.results = context.results || {}; const status = (Array.isArray(content) && content.length > 0) ? 'fail_critical' : 'pass'; context.results['core-attachments'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "core-links",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-dmarc",
+    "logic": "context.results = context.results || {}; const status = content === 'pass' ? 'pass_downgrade' : 'fail_pass'; context.results['metadata-dmarc'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-authenticity-dkim",
+    "logic": "context.results = context.results || {}; const status = content === 'pass' ? 'pass_downgrade' : 'fail_pass'; context.results['metadata-dkim'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-authenticity-spf",
+    "logic": "context.results = context.results || {}; const status = content === 'pass' ? 'pass' : 'fail_pass'; context.results['metadata-spf'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-authenticity-auth_string",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-origin-ip",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-origin-sid_result",
+    "logic": "context.results = context.results || {}; const status = content.toLowerCase() === 'pass' ? 'pass_downgrade' : 'fail_pass'; context.results['metadata-sid'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-path-return_path",
+    "logic": "context.results = context.results || {}; const status = (!context.senderDomain || content.includes(context.senderDomain)) ? 'pass' : 'fail_critical'; context.results['metadata-return_path'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-path-is_forwarded",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-path-hop_count",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-content_type",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-is_multipart",
+    "logic": "context.results = context.results || {}; const status = content === false ? 'fail_pass' : 'pass'; context.results['metadata-is_multipart'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-technical-encoding",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-mime_version",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-behavioural-header_count",
+    "logic": "context.results = context.results || {}; let s = 'pass'; if (content < 15) s = 'fail_pass'; if (content > 25) s = 'pass_downgrade'; context.results['metadata-headers'] = s; return { status: s };"
+  },
+  {
+    "scan_type": "metadata-behavioural-mailer",
+    "logic": "context.results = context.results || {}; const susp = [/php/i, /python/i, /mailer/i, /smtp/i]; const status = susp.some(p => p.test(content)) ? 'fail_pass' : 'pass'; context.results['metadata-mailer'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "metadata-behavioural-traffic_type",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "integrity-dkim_verified",
+    "logic": "context.results = context.results || {}; const status = content === true ? 'pass' : 'fail_pass'; context.results['integrity-dkim'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "integrity-source_pipe",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "content-links",
+    "logic": "context.results = context.results || {}; if (!Array.isArray(content) || content.length === 0) { context.results['links-aligned'] = 'pass'; return { status: 'pass' }; } const m = content.every(l => context.senderDomain ? l.includes(context.senderDomain) : false); const status = m ? 'pass_downgrade' : 'fail_pass'; context.results['links-aligned'] = status; return { status: status };"
+  },
+  {
+    "scan_type": "content-attachments",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "content-text",
+    "logic": "ignore"
+  }
+]

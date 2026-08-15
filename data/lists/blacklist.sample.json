@@ -1,0 +1,14 @@
+{
+  "blacklist": [
+    {
+      "email": "scam@phisher.example",
+      "friendly_name": "Bad Actor",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

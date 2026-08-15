@@ -1,0 +1,106 @@
+[
+  {
+    "field": "core-original_sender",
+    "type": "func",
+    "func": "level3_funcs.capture_sender_domain"
+  },
+  {
+    "field": "core-title",
+    "type": "regex_any",
+    "patterns": ["Ref:\\[[A-Z0-9]+\\]"],
+    "result_if_match": "pass_service",
+    "result_if_no_match": "pass",
+    "comment": "A transactional reference number reads as service mail, not phishing."
+  },
+  {
+    "field": "core-clean_text",
+    "type": "regex_all",
+    "patterns": [
+      "never contact you.*validate personal information",
+      "Ref:\\[[A-Z0-9]+\\]",
+      "\\(\\d{2,3}\\)\\s\\d{4,}"
+    ],
+    "result_if_match": "pass_service",
+    "result_if_no_match": "pass",
+    "comment": "All three together (anti-phishing disclaimer + reference + hotline) mark a genuine service template."
+  },
+  { "field": "core-attachments", "type": "ignore" },
+  { "field": "core-links", "type": "ignore" },
+
+  { "field": "metadata-authenticity-dmarc", "type": "ignore" },
+  { "field": "metadata-authenticity-dkim", "type": "ignore" },
+  { "field": "metadata-authenticity-spf", "type": "ignore" },
+  {
+    "field": "metadata-authenticity-auth_string",
+    "type": "func",
+    "func": "level3_funcs.dkim_domain_alignment"
+  },
+
+  { "field": "metadata-origin-ip", "type": "ignore" },
+  { "field": "metadata-origin-sid_result", "type": "ignore" },
+
+  {
+    "field": "metadata-path-return_path",
+    "type": "regex_any",
+    "patterns": ["SRS="],
+    "result_if_match": "pass_service",
+    "result_if_no_match": "pass",
+    "comment": "Sender Rewriting Scheme means a legitimate forward."
+  },
+  { "field": "metadata-path-is_forwarded", "type": "ignore" },
+  {
+    "field": "metadata-path-hop_count",
+    "type": "func",
+    "func": "level3_funcs.hop_count_with_srs"
+  },
+
+  { "field": "metadata-technical-content_type", "type": "ignore" },
+  {
+    "field": "metadata-technical-is_multipart",
+    "type": "equals",
+    "value": true,
+    "result_if_match": "pass_service",
+    "result_if_no_match": "pass"
+  },
+  {
+    "field": "metadata-technical-encoding",
+    "type": "regex_any",
+    "patterns": ["base64"],
+    "result_if_match": "fail_spam",
+    "result_if_no_match": "pass"
+  },
+  { "field": "metadata-technical-mime_version", "type": "ignore" },
+
+  {
+    "field": "metadata-behavioural-header_count",
+    "type": "func",
+    "func": "level3_funcs.header_count_high"
+  },
+  {
+    "field": "metadata-behavioural-mailer",
+    "type": "regex_any",
+    "patterns": ["^SER-[a-f0-9]+"],
+    "ignore_case": false,
+    "result_if_match": "pass_service",
+    "result_if_no_match": "fail_spam",
+    "comment": "Case-sensitive on purpose: the prototype's /^SER-[a-f0-9]+/ carried no /i flag."
+  },
+  { "field": "metadata-behavioural-traffic_type", "type": "ignore" },
+
+  { "field": "integrity-dkim_verified", "type": "ignore" },
+  { "field": "integrity-source_pipe", "type": "ignore" },
+
+  {
+    "field": "content-links",
+    "type": "func",
+    "func": "level3_funcs.links_aligned_with_sender",
+    "comment": "Compares real link hosts (re-fanged internally) against the sender's registrable domain; see the function for why the return path is not usable here."
+  },
+  { "field": "content-attachments", "type": "ignore" },
+  { "field": "content-text", "type": "ignore" },
+  {
+    "field": "content-timestamp",
+    "type": "ignore",
+    "comment": "Not in the prototype's scan-item list; declared explicitly so no scan point falls through as 'unknown'."
+  }
+]

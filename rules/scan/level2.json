@@ -1,0 +1,117 @@
+[
+  {
+    "field": "core-original_sender",
+    "type": "func",
+    "func": "level2_funcs.capture_sender_domain",
+    "comment": "Derives context.senderDomain for the return-path and link rules below."
+  },
+  {
+    "field": "core-title",
+    "type": "regex_any",
+    "patterns": ["urgent", "action required", "payment", "alert", "notification"],
+    "result_if_match": "fail_pass",
+    "result_if_no_match": "pass"
+  },
+  {
+    "field": "core-clean_text",
+    "type": "regex_any",
+    "patterns": ["verify", "login", "update", "confirm", "click"],
+    "result_if_match": "fail_pass",
+    "result_if_no_match": "pass"
+  },
+  {
+    "field": "core-attachments",
+    "type": "non_empty",
+    "result_if_match": "fail_critical",
+    "result_if_no_match": "pass",
+    "comment": "At level 2 any attachment is treated as a payload."
+  },
+  { "field": "core-links", "type": "ignore" },
+
+  {
+    "field": "metadata-authenticity-dmarc",
+    "type": "equals",
+    "value": "pass",
+    "result_if_match": "pass_downgrade",
+    "result_if_no_match": "fail_pass"
+  },
+  {
+    "field": "metadata-authenticity-dkim",
+    "type": "equals",
+    "value": "pass",
+    "result_if_match": "pass_downgrade",
+    "result_if_no_match": "fail_pass"
+  },
+  {
+    "field": "metadata-authenticity-spf",
+    "type": "equals",
+    "value": "pass",
+    "result_if_match": "pass",
+    "result_if_no_match": "fail_pass"
+  },
+  { "field": "metadata-authenticity-auth_string", "type": "ignore" },
+
+  { "field": "metadata-origin-ip", "type": "ignore" },
+  {
+    "field": "metadata-origin-sid_result",
+    "type": "equals",
+    "value": "pass",
+    "ignore_case": true,
+    "result_if_match": "pass_downgrade",
+    "result_if_no_match": "fail_pass"
+  },
+
+  {
+    "field": "metadata-path-return_path",
+    "type": "func",
+    "func": "level2_funcs.return_path_alignment"
+  },
+  { "field": "metadata-path-is_forwarded", "type": "ignore" },
+  { "field": "metadata-path-hop_count", "type": "ignore" },
+
+  { "field": "metadata-technical-content_type", "type": "ignore" },
+  {
+    "field": "metadata-technical-is_multipart",
+    "type": "is_false",
+    "result_if_match": "fail_pass",
+    "result_if_no_match": "pass"
+  },
+  { "field": "metadata-technical-encoding", "type": "ignore" },
+  { "field": "metadata-technical-mime_version", "type": "ignore" },
+
+  {
+    "field": "metadata-behavioural-header_count",
+    "type": "func",
+    "func": "level2_funcs.header_count_band"
+  },
+  {
+    "field": "metadata-behavioural-mailer",
+    "type": "regex_any",
+    "patterns": ["php", "python", "mailer", "smtp"],
+    "result_if_match": "fail_pass",
+    "result_if_no_match": "pass"
+  },
+  { "field": "metadata-behavioural-traffic_type", "type": "ignore" },
+
+  {
+    "field": "integrity-dkim_verified",
+    "type": "equals",
+    "value": true,
+    "result_if_match": "pass",
+    "result_if_no_match": "fail_pass"
+  },
+  { "field": "integrity-source_pipe", "type": "ignore" },
+
+  {
+    "field": "content-links",
+    "type": "func",
+    "func": "level2_funcs.links_aligned_with_sender"
+  },
+  { "field": "content-attachments", "type": "ignore" },
+  { "field": "content-text", "type": "ignore" },
+  {
+    "field": "content-timestamp",
+    "type": "ignore",
+    "comment": "Not in the prototype's scan-item list; declared explicitly so no scan point falls through as 'unknown'."
+  }
+]

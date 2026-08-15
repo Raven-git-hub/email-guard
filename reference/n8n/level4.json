@@ -1,0 +1,106 @@
+[
+  {
+    "scan_type": "core-original_sender",
+    "logic": "const parts = content.split('@'); const domain = parts[1] || ''; const isMajorProvider = domain.endsWith('live.com') || domain.endsWith('outlook.com') || domain.endsWith('gmail.com'); return { status: isMajorProvider ? 'pass' : 'fail' };"
+  },
+  {
+    "scan_type": "core-title",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "core-clean_text",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "core-attachments",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "core-links",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-dmarc",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-dkim",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-spf",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-authenticity-auth_string",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-origin-ip",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-origin-sid_result",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-path-return_path",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-path-is_forwarded",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-path-hop_count",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-content_type",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-is_multipart",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-encoding",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-technical-mime_version",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-behavioural-header_count",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-behavioural-mailer",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "metadata-behavioural-traffic_type",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "integrity-dkim_verified",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "integrity-source_pipe",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "content-links",
+    "logic": "if (!Array.isArray(content)) return { status: 'pass' }; const suspicious = content.filter(l => l.includes('bit.ly') || l.includes('t.co') || l.includes('tinyurl') || l.includes('duckdns')); return { status: suspicious.length > 0 ? 'fail' : 'pass' };"
+  },
+  {
+    "scan_type": "content-attachments",
+    "logic": "ignore"
+  },
+  {
+    "scan_type": "content-text",
+    "logic": "ignore"
+  }
+]
