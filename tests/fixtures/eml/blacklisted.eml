@@ -1,0 +1,13 @@
+From: "Bad Actor" <scam@phisher.example>
+To: owner@example.com
+Subject: Final notice about your account
+Message-ID: <blacklisted-0001@phisher.example>
+Date: Fri, 15 May 2026 09:14:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+SYNTHETIC test fixture -- the sender is on the synthetic blacklist, so this
+message must land in the rejected bucket whatever the body says.
+
+Please confirm your details at https://phisher.example/confirm before Friday.

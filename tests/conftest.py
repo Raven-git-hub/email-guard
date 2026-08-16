@@ -8,6 +8,11 @@ The same rule applies to the output stage: tests write into pytest ``tmp_path``
 directories, never into the repo's ``data/outbound`` or ``data/daily-brief``.
 :func:`repo_data_stays_empty` enforces that, so a test that forgets to pass its
 output directories fails loudly instead of quietly filling the working tree.
+
+``data/dispatcher`` is guarded the same way. The dispatcher's state file and
+quarantine log record who emailed the owner and when, so a dispatcher test that
+forgets its ``tmp_path`` paths must fail rather than quietly write real state
+into the working tree.
 """
 
 from __future__ import annotations
@@ -35,17 +40,21 @@ _rules_validate = load_module_from_path(RULES_DIR / "validate.py", "_test_rules_
 validate_pack = _rules_validate.validate_pack
 
 
-OUTPUT_DIRS = (PROJECT_ROOT / "data" / "outbound", PROJECT_ROOT / "data" / "daily-brief")
+OUTPUT_DIRS = (
+    PROJECT_ROOT / "data" / "outbound",
+    PROJECT_ROOT / "data" / "daily-brief",
+    PROJECT_ROOT / "data" / "dispatcher",
+)
 
 
 @pytest.fixture(autouse=True)
 def repo_data_stays_empty():
-    """Fail any test that writes into the repo's real output directories."""
+    """Fail any test that writes into the repo's real runtime directories."""
     before = _output_contents()
     yield
     assert _output_contents() == before, (
         "a test wrote into the repo's data/ directories -- pass tmp_path-based "
-        "--outbound-dir / --daily-brief-dir instead"
+        "--outbound-dir / --daily-brief-dir (or state_file / quarantine_log) instead"
     )
 
 

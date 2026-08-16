@@ -2,5 +2,23 @@
   "lists_dir": "data/lists",
   "rules_dir": "rules",
   "outbound_dir": "data/outbound",
-  "daily_brief_dir": "data/daily-brief"
+  "daily_brief_dir": "data/daily-brief",
+
+  "imap": {
+    "host": "127.0.0.1",
+    "port": 1143,
+    "mailbox": "INBOX",
+    "tls": "starttls",
+    "ca_file": null,
+    "poll_interval_seconds": 30,
+    "max_attempts": 3,
+    "concurrency": 4,
+    "scan_timeout_seconds": 120
+  },
+
+  "dispatcher": {
+    "state_file": "data/dispatcher/state.json",
+    "quarantine_log": "data/dispatcher/quarantine.log",
+    "webhook_url": null
+  }
 }

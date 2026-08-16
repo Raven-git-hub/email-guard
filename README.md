@@ -59,7 +59,7 @@ The rules pack contains:
 | Source cleaners (Outlook / Gmail / Proton) | Provided; contracts to be standardised |
 | Triage / initial level assignment | Exists; greylist matching to be updated to current schema |
 | Prompt-injection signature DB | **Does not exist yet** — starts empty, grows over time |
-| Docker dispatcher + scanner | **To be built** |
+| Dispatcher (bridge IMAP → scanner) | **Built** — poll-based; runs the scanner as a subprocess, IDLE and per-email containers still to come |
 | Canary (local LLM) semantic checks | **To be built** |
 | Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
 | Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; review UI + applier to be built |
@@ -273,6 +273,124 @@ the repo ships only the empty directories.
 
 ---
 
+## Running the dispatcher against the Proton bridge
+
+The scanner handles one message. The **dispatcher** is the always-on process that feeds it:
+it holds an IMAP connection to the Proton Mail Bridge, pulls each new message, and runs
+`python -m email_guard` on it as a subprocess.
+
+The dispatcher deliberately knows nothing about how a message is scored. It hands over raw
+bytes and reads the verdict back off stdout, and it passes **no** `--lists-dir` /
+`--outbound-dir` flags — the scanner resolves its own configuration exactly as it does when
+you run it by hand. That keeps the scanner a pure function in container form and the
+dispatcher dumb enough to swap for a worker pool later.
+
+### 1. Configure the connection
+
+The non-secret settings live in the `imap` section of `config/config.json`:
+
+```json
+"imap": {
+  "host": "127.0.0.1",
+  "port": 1143,
+  "mailbox": "INBOX",
+  "tls": "starttls",
+  "ca_file": null,
+  "poll_interval_seconds": 30,
+  "max_attempts": 3,
+  "concurrency": 4,
+  "scan_timeout_seconds": 120
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `host` / `port` | Where the bridge listens. `127.0.0.1:1143` is the bridge's default local IMAP. |
+| `mailbox` | Which mailbox to watch. |
+| `tls` | `starttls` (the bridge's default), `ssl`, or `none`. |
+| `ca_file` | A CA bundle to verify the bridge certificate against. Usually unnecessary — see below. |
+| `poll_interval_seconds` | How often to check for new mail. |
+| `max_attempts` | Scans per message before it is quarantined. |
+| `concurrency` | Simultaneous scanner subprocesses. |
+
+**About the certificate.** The bridge generates its own self-signed certificate at install
+time, so there is nothing to verify it against. On a **loopback** host (`127.0.0.1`, `::1`,
+`localhost`) the dispatcher accepts it — the connection never leaves the machine, so there is
+no network attacker to defend against. On **any other host** the certificate is verified
+normally and a self-signed one will be rejected; point `ca_file` at the bridge's certificate
+if you genuinely run it on another machine. Verification is never silently disabled for a
+remote host.
+
+### 2. Provide the bridge credentials
+
+These are the credentials **Proton Mail Bridge generates for the account** — not your Proton
+account password. Find them in the Bridge app: select the account → *Mailbox details* (or
+*Configure*), which shows the IMAP username and a generated password.
+
+They must never enter git. Either put them in the environment:
+
+```sh
+export EMAIL_GUARD_IMAP_USERNAME='you@proton.me'
+export EMAIL_GUARD_IMAP_PASSWORD='the-bridge-generated-password'
+```
+
+…or copy `config/secrets.sample.json` to `config/secrets.json` (git-ignored) and fill it in.
+The environment wins if both are present.
+
+### 3. First run
+
+Install once, then drain what is currently unread and stop:
+
+```sh
+pip install -e ".[dev]"
+python -m email_guard_dispatcher --once --verbose
+```
+
+`--once` scans the currently-UNSEEN messages and exits — the right shape for a first live
+test and for cron. `--verbose` prints one line per message: uid, sender, final level, bucket.
+Drop `--once` to run the poll loop until stopped:
+
+```sh
+python -m email_guard_dispatcher            # polls every poll_interval_seconds
+```
+
+> **The first live run processes your entire unread backlog.** The dispatcher finds work with
+> `SEARCH UNSEEN`, so every unread message in the mailbox is scanned on that first pass. Point
+> the first `--once` run at a small or test intake mailbox (`--mailbox Intake`) before turning
+> it loose on a real inbox.
+>
+> The converse also matters: **a message already marked `\Seen` by another client is never
+> scanned.** That is fine for the intended setup — a dedicated intake mailbox that no human
+> reads — but it means the dispatcher is not safe to point at a mailbox you browse yourself,
+> because anything you open first will be skipped.
+
+### What it does with each message
+
+1. `FETCH` the raw RFC822 bytes by UID (with `BODY.PEEK[]`, so reading does not mark the
+   message seen before it has actually been scanned).
+2. Write them to a temp `.eml`, run `python -m email_guard <tmpfile>`, capture the verdict
+   JSON from stdout and the exit code, delete the temp file. The scanner files the message
+   into `outbound/<bucket>/<job>/` itself.
+3. On success: record the message as processed, mark it `\Seen`, and hand the verdict to the
+   configured sinks.
+4. On failure: retry up to `max_attempts`. After that, write a line to the quarantine log and
+   mark it processed anyway, so one bad message cannot block everything behind it.
+
+Processed messages are recorded by `(UIDVALIDITY, UID)` in `data/dispatcher/state.json`, so a
+restart does not rescan them. That file — not the `\Seen` flag — is the authority: any client
+can clear a flag, and quarantined messages are recorded there too so a cleared flag cannot
+replay a known-bad message. Both it and `data/dispatcher/quarantine.log` name real
+correspondents, so both are git-ignored.
+
+### Optional webhook
+
+Set `dispatcher.webhook_url` in `config/config.json` or `EMAIL_GUARD_WEBHOOK_URL` in the
+environment and each verdict is POSTed as JSON, with a short retry and backoff. With no URL
+set, the default sink just logs the verdict. Delivery is currently best-effort — a durable
+retry queue is still to come.
+
+---
+
 ## Databases & the daily review
 
 ### List schemas (from the live samples)
@@ -354,8 +472,14 @@ email-guard/
 ├── .gitignore                   # ignores data/lists/*.json (keeps *.sample.json)
 ├── docker-compose.yml          # bridge + dispatcher + canary + ui + volumes
 ├── dispatcher/
-│   ├── Dockerfile
-│   └── src/                     # IMAP IDLE watcher, scanner spawner, webhook delivery
+│   └── email_guard_dispatcher/ # Python package: bridge IMAP in, scanner subprocesses out
+│       ├── __main__.py         # --once / poll loop
+│       ├── config.py           # imap section + secrets (env or git-ignored file)
+│       ├── mailsource.py       # MailSource protocol, ImapMailSource, FakeMailSource
+│       ├── scanner_client.py   # runs `python -m email_guard`, reads the verdict
+│       ├── state.py            # processed (UIDVALIDITY, UID) + quarantine log
+│       ├── sinks.py            # verdict output: logging, optional webhook
+│       └── runner.py           # fetch -> scan (pooled) -> commit (serial)
 ├── scanner/
 │   ├── Dockerfile
 │   └── email_guard/            # Python package: .eml + rules pack in → verdict out
@@ -377,14 +501,16 @@ email-guard/
 ├── canary/                      # local model service config (e.g. Ollama)
 ├── ui/                          # LAN-only console
 ├── config/
-│   └── config.json             # single unified config (replaces path files + index refs)
+│   ├── config.json             # single unified config (replaces path files + index refs)
+│   └── secrets.sample.json     # template for config/secrets.json (git-ignored)
 ├── tests/
 │   └── fixtures/
 │       └── lists/              # SYNTHETIC list fixtures (committed, safe to publish)
 └── data/                        # runtime data — git-ignored except *.sample.json
     ├── lists/                  # live lists (host-provided / bind-mounted); ships *.sample.json + .gitkeep
     ├── daily-brief/            # staged candidates awaiting review
-    └── outbound/               # cleared/  flagged/  rejected/
+    ├── outbound/               # cleared/  flagged/  rejected/
+    └── dispatcher/             # state.json (processed UIDs) + quarantine.log
 ```
 
 ---
@@ -421,7 +547,8 @@ email-guard/
 5. Unify configuration into one named config; drop index-based path references.
 6. Add the Canary client and stand up the local LLM service; gate on level 1–2.
 7. Containerise the scanner (`--rm`); test offline against saved messages.
-8. Build the dispatcher (IMAP `IDLE` → spawn) with concurrency + webhook delivery.
+8. ~~Build the dispatcher (IMAP → spawn) with concurrency + webhook delivery.~~ **Done**,
+   poll-based. Still to do: IMAP `IDLE` for latency, and a durable webhook retry queue.
 9. Formalise output sinks and the **action** payload; add `action` to the greylist schema.
 10. Build the review → applier half of the learning loop, and the Admin UI (the scanner
     already stages candidates into `daily-brief-{date}/`).

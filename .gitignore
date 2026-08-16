@@ -10,6 +10,16 @@ data/daily-brief/**
 data/outbound/**
 !data/outbound/.gitkeep
 
+# Dispatcher runtime state: which messages have been handled, and the
+# quarantine trail for the ones that could not be scanned. Both name real
+# correspondents, so neither is committed.
+data/dispatcher/**
+!data/dispatcher/.gitkeep
+
+# --- IMAP credentials: bridge-generated, never committed (README "Running the
+# dispatcher against the Proton bridge"). The sample stays. ---
+config/secrets.json
+
 # --- Python ---
 __pycache__/
 *.py[cod]

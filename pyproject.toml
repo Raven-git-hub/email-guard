@@ -16,12 +16,14 @@ dev = ["pytest>=7"]
 
 [project.scripts]
 email-guard = "email_guard.cli:main"
+email-guard-dispatcher = "email_guard_dispatcher.__main__:main"
 
-[tool.setuptools]
-package-dir = { "" = "scanner" }
-
+# Two package roots, one distribution: the dispatcher runs the scanner as
+# `python -m email_guard`, so they have to share an interpreter, and a single
+# editable install keeps that true. The dispatcher imports nothing from the
+# scanner -- the subprocess boundary is the whole interface.
 [tool.setuptools.packages.find]
-where = ["scanner"]
+where = ["scanner", "dispatcher"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
