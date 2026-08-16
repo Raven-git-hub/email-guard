@@ -28,6 +28,9 @@ from an unknown domain is a level 3 to be looked at, not a level 2 suspect.
 Priority ladder, first match wins:
 
     1. blacklist hit                                        -> 1
+    1b. greylist "denied" -- a catalogued shape the reviewer
+       marked unwanted. A blacklist entry scoped to one
+       message shape rather than a whole sender             -> 1
     2. injection detected -- the hard-baked floor below, or
        the level-1 injection signature feed. Fires even for
        a whitelisted sender: no legitimate sender embeds
@@ -47,6 +50,11 @@ Note the ordering of 4 before 5, which is what the ``and not whitelisted``
 qualifier in rule 4 implies: a whitelisted address on a greylisted domain is
 judged by the domain's catalogued shape, so an uncatalogued message from it
 still lands at 3 for review rather than being waved through at 5.
+
+Rule 1b does not breach "triage reads message content only". The content ->
+disposition decision belongs to :func:`email_guard.lists.classify_greylist`,
+which reads the subject and body against the catalogued shapes; triage receives
+only the resulting classification string, exactly as it always has.
 """
 
 from __future__ import annotations
@@ -54,7 +62,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .lists import GREYLIST_KNOWN, GREYLIST_NEW_STRUCTURE, GREYLIST_NONE
+from .lists import (
+    GREYLIST_DENIED,
+    GREYLIST_KNOWN,
+    GREYLIST_NEW_STRUCTURE,
+    GREYLIST_NONE,
+)
 from .signatures import SignatureFeed
 
 # ---------------------------------------------------------------------------
@@ -146,6 +159,13 @@ def initial_level(
     # Rule 1 -- identity, decided by the lists.
     if message.get("blacklist_hit"):
         return 1, ["blacklist_hit"]
+
+    # Rule 1b -- a denied structure rejects exactly like a blacklist entry, and
+    # for the same reason: the reviewer has already judged this shape. A
+    # greylisted domain is never whitelisted (lists are mutually exclusive --
+    # see `lists.validate_lists`), so there is no override to reconcile here.
+    if greylist_classification == GREYLIST_DENIED:
+        return 1, ["greylist_denied_structure"]
 
     # Rule 2 -- injection. Checked before the whitelist on purpose.
     markers = injection_markers(content)

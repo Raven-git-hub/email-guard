@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from email_guard.lists import GREYLIST_KNOWN, GREYLIST_NEW_STRUCTURE, GREYLIST_NONE
+from email_guard.lists import (
+    GREYLIST_DENIED,
+    GREYLIST_KNOWN,
+    GREYLIST_NEW_STRUCTURE,
+    GREYLIST_NONE,
+)
 from email_guard.signatures import Signature, SignatureFeed, load_signature_feed
 from email_guard.triage import initial_level, injection_markers
 
@@ -350,12 +355,19 @@ def test_a_whitelisted_sender_on_a_catalogued_shape_is_level_4():
 # --- list precedence, end to end -----------------------------------------------
 
 
-def test_blacklisted_sender_is_level_1_even_when_also_whitelisted(scan, tmp_path):
+def test_blacklisted_sender_is_level_1_even_when_also_whitelisted(
+    scan, conflicting_lists, tmp_path
+):
     """A sender on BOTH lists is rejected: the blacklist wins outright.
 
     Rule 1 fires before the whitelist override in rule 7, so a compromised or
     revoked contact cannot buy trust back by still sitting on the whitelist.
-    ``both@conflict.example`` appears on both fixture lists on purpose.
+
+    Lists are now mutually exclusive, so a validated load can no longer produce
+    this state -- which is precisely why it is still worth pinning. The
+    ``conflicting_lists`` fixture loads ``tests/fixtures/lists-conflict/`` with
+    validation off, so the guarantee survives a hand-edited list that slipped
+    past the invariant.
     """
     message = (
         b"Return-Path: <both@conflict.example>\r\n"
@@ -369,7 +381,7 @@ def test_blacklisted_sender_is_level_1_even_when_also_whitelisted(scan, tmp_path
     path = tmp_path / "conflict.eml"
     path.write_bytes(message)
 
-    verdict = scan(path)
+    verdict = scan(path, use_lists=conflicting_lists)
 
     assert verdict["list_hits"]["blacklist"] is True
     assert verdict["list_hits"]["whitelist"] is True
@@ -405,3 +417,36 @@ def test_friendly_name_resolves_by_verdict_priority(lists):
     # A greylist entry carrying no friendly_name (the live schema) must not
     # clobber the fallback with an empty value.
     assert _friendly_name("a@x.example", "proton", None, {"domain": "x.example"}, None) == "proton-a"
+
+
+# --- rule 1b: a denied greylist structure --------------------------------------
+
+
+def test_a_denied_structure_is_level_1():
+    """A denied shape rejects exactly as a blacklist entry does.
+
+    It is a blacklist entry scoped to one message shape: the domain is fine,
+    this shape from it is not.
+    """
+    level, reasons = initial_level(message(greylist_hit=True), GREYLIST_DENIED)
+    assert level == 1
+    assert reasons == ["greylist_denied_structure"]
+
+
+def test_a_denied_structure_outranks_a_whitelist_hit():
+    """Rule 1b fires before the whitelist override, like rule 1.
+
+    Lists are mutually exclusive so a greylisted domain is never whitelisted,
+    but the ordering is what makes that safe to rely on rather than a
+    coincidence of rule placement.
+    """
+    level, reasons = initial_level(message(whitelist_hit=True), GREYLIST_DENIED)
+    assert level == 1
+    assert reasons == ["greylist_denied_structure"]
+
+
+def test_a_blacklisted_sender_outranks_a_denied_structure():
+    """Both reject; the reason names the stronger signal."""
+    level, reasons = initial_level(message(blacklist_hit=True), GREYLIST_DENIED)
+    assert level == 1
+    assert reasons == ["blacklist_hit"]

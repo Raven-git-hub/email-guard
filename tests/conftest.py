@@ -13,6 +13,10 @@ output directories fails loudly instead of quietly filling the working tree.
 quarantine log record who emailed the owner and when, so a dispatcher test that
 forgets its ``tmp_path`` paths must fail rather than quietly write real state
 into the working tree.
+
+``data/lists`` joined that guard with the applier, which is the first code in
+the repo that writes lists at all. An applier test that forgets its
+``--lists-dir`` would otherwise edit the operator's live lists.
 """
 
 from __future__ import annotations
@@ -30,6 +34,10 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 FIXTURES = TESTS_DIR / "fixtures"
 LIST_FIXTURES = FIXTURES / "lists"
+# A deliberately invalid pair of lists: one address on two of them. It exists to
+# be rejected by the exclusivity validator, and to keep list *precedence*
+# testable in the state a validated load can no longer produce.
+CONFLICT_LIST_FIXTURES = FIXTURES / "lists-conflict"
 JSON_FIXTURES = FIXTURES / "json"
 EML_FIXTURES = FIXTURES / "eml"
 RULES_DIR = PROJECT_ROOT / "rules"
@@ -44,6 +52,7 @@ OUTPUT_DIRS = (
     PROJECT_ROOT / "data" / "outbound",
     PROJECT_ROOT / "data" / "daily-brief",
     PROJECT_ROOT / "data" / "dispatcher",
+    PROJECT_ROOT / "data" / "lists",
 )
 
 # --- injection corpora, shared by the feed tests and the hard-baked floor -----
@@ -126,6 +135,35 @@ def lists() -> Lists:
 @pytest.fixture
 def empty_lists() -> Lists:
     return Lists()
+
+
+@pytest.fixture
+def conflicting_lists() -> Lists:
+    """One address on two lists, loaded past the validator on purpose.
+
+    Precedence is exactly what still has to hold when a contradictory list
+    slips through -- by a hand-edit, or a list written before the exclusivity
+    invariant existed -- so the test that locks it opts out of validation
+    rather than losing the case altogether.
+    """
+    return Lists.load(CONFLICT_LIST_FIXTURES, validate=False)
+
+
+@pytest.fixture
+def live_lists(tmp_path: Path) -> Path:
+    """A writable copy of the list fixtures: the applier's target directory.
+
+    The committed fixtures are never written to. Nothing else in the suite
+    guards them -- ``repo_data_stays_empty`` watches ``data/``, not
+    ``tests/fixtures/`` -- so applier tests take a copy instead.
+    """
+    target = tmp_path / "lists"
+    target.mkdir()
+    for source in sorted(LIST_FIXTURES.glob("*.json")):
+        (target / source.name).write_text(
+            source.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    return target
 
 
 @pytest.fixture

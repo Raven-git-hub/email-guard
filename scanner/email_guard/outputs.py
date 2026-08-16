@@ -18,6 +18,7 @@ def build_verdict(
     greylist_classification: str,
     canary_result: dict[str, Any],
     proposal: dict[str, Any],
+    tags: list[str] | None = None,
 ) -> dict[str, Any]:
     initial_level = report["header"]["initialLevel"]
     final_level = report["finalLevel"]
@@ -36,6 +37,10 @@ def build_verdict(
             "blacklist": bool(message.get("blacklist_hit")),
         },
         "greylist_classification": greylist_classification,
+        # Routing labels from the greylist structure this message matched, for
+        # the downstream webhook to dispatch on. Tags never affect the level --
+        # they say what a message *is*, not how dangerous it is.
+        "tags": list(tags or []),
         "forensic_log": list(report.get("forensicLog") or []),
         "links": list(message.get("links") or []),
         "attachments": list(message.get("attachments") or []),

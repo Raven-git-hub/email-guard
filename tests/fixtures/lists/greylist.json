@@ -1,5 +1,5 @@
 {
-  "_note": "SYNTHETIC test fixture -- fully invented senders on reserved .example domains. Never the live lists. Covers every greylist branch: structures with a Subject: phrase, a named ALL EMAILS match-all, a named structure with empty key_phrases, and a domain with no structures at all.",
+  "_note": "SYNTHETIC test fixture -- fully invented senders on reserved .example domains. Never the live lists. Covers every greylist branch: structures with a Subject: phrase, a named ALL EMAILS match-all, a named structure with empty key_phrases, a domain with no structures at all, and a domain carrying both an allowed and a denied structure so denied-wins has something to win against.",
   "greylist": [
     {
       "domain": "northgate-bank.example",
@@ -50,6 +50,39 @@
           "key_phrases": [
             "Subject: Your receipt",
             "thank you for your order"
+          ],
+          "tags": [
+            "receipt"
+          ]
+        }
+      ],
+      "tags": [
+        "receipts",
+        "finance"
+      ]
+    },
+    {
+      "domain": "mixedsignals.example",
+      "tags": [
+        "newsletter"
+      ],
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": [],
+          "tags": [
+            "bulk"
+          ]
+        },
+        {
+          "name": "Password Reset Bait",
+          "key_phrases": [
+            "Subject: Reset your password",
+            "confirm your password now"
+          ],
+          "disposition": "denied",
+          "tags": [
+            "credential-bait"
           ]
         }
       ]

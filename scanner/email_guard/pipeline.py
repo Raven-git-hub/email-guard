@@ -24,7 +24,7 @@ from typing import Any
 from . import canary as canary_module
 from . import deepscan, loop, propose, route, triage
 from .clean import clean
-from .lists import Lists, classify_greylist
+from .lists import GREYLIST_KNOWN, Lists, classify_greylist, tags_of
 from .outputs import build_verdict
 from .route import SourceMessage
 from .rulespack import RulesPack
@@ -51,9 +51,13 @@ def scan(
 
     sender = message["original_sender"]
     sender_domain = sender.split("@")[1] if "@" in sender else ""
-    greylist_classification, grey_entry, _structure = classify_greylist(
+    greylist_classification, grey_entry, grey_structure = classify_greylist(
         lists.greylist, sender, sender_domain, message["title"], message["clean_text"]
     )
+
+    # Only an *allowed* match carries routing labels: a denied message is
+    # rejected, so there is nothing downstream to route it to.
+    tags = tags_of(grey_structure) if greylist_classification == GREYLIST_KNOWN else []
 
     initial_level, reasons = triage.initial_level(
         message, greylist_classification, pack.signature_feed
@@ -75,7 +79,9 @@ def scan(
     )
 
     proposal = propose.classify(message, greylist_classification)
-    verdict = build_verdict(message, report, greylist_classification, canary_result, proposal)
+    verdict = build_verdict(
+        message, report, greylist_classification, canary_result, proposal, tags
+    )
 
     return ScanResult(
         verdict=verdict, message=message, proposal=proposal, greylist_entry=grey_entry

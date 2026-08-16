@@ -2,18 +2,30 @@
   "greylist": [
     {
       "domain": "northgate-bank.example",
+      "tags": ["finance"],
       "known_structures": [
         {
           "name": "Statement Ready Notice",
           "key_phrases": [
             "Subject: Your statement is ready",
             "your monthly statement is now available"
-          ]
+          ],
+          "disposition": "allowed",
+          "tags": ["statements"]
+        },
+        {
+          "name": "Password Reset Bait",
+          "key_phrases": [
+            "Subject: Reset your password immediately"
+          ],
+          "disposition": "denied",
+          "tags": ["credential-bait"]
         }
       ]
     },
     {
       "domain": "shopfast.example",
+      "tags": [],
       "known_structures": [
         {
           "name": "ALL EMAILS",

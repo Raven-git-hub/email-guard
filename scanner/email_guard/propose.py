@@ -24,7 +24,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .lists import GREYLIST_NEW_STRUCTURE, GREYLIST_NONE
+from .lists import GREYLIST_DENIED, GREYLIST_NEW_STRUCTURE, GREYLIST_NONE
 from .route import write_json
 
 UNKNOWN_DOMAIN = "unknown_domain"
@@ -53,6 +53,10 @@ def classify(message: dict[str, Any], greylist_classification: str) -> dict[str,
 
     if message.get("blacklist_hit"):
         return {"classification": SKIP, "reason": "sender is already blacklisted"}
+    # A denied match is as catalogued as an allowed one -- the reviewer has
+    # already seen this shape and rejected it, so there is nothing to propose.
+    if greylist_classification == GREYLIST_DENIED:
+        return {"classification": SKIP, "reason": "message matches a denied structure"}
     if message.get("whitelist_hit"):
         return {"classification": SKIP, "reason": "sender is already whitelisted"}
 

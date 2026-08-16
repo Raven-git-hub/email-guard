@@ -22,6 +22,7 @@ VERDICT_KEYS = {
     "bucket",
     "list_hits",
     "greylist_classification",
+    "tags",
     "forensic_log",
     "links",
     "attachments",

@@ -1,0 +1,15 @@
+{
+  "_note": "SYNTHETIC test fixture -- DELIBERATELY INVALID. See the note in whitelist.json beside it: `both@conflict.example` is on both lists on purpose.",
+  "blacklist": [
+    {
+      "email": "both@conflict.example",
+      "friendly_name": "Listed Twice (blacklist side)",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

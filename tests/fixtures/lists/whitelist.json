@@ -1,19 +1,10 @@
 {
-  "_note": "SYNTHETIC test fixture -- invented contacts only. `both@conflict.example` also appears on the blacklist, on purpose, to lock list precedence.",
+  "_note": "SYNTHETIC test fixture -- invented contacts only. This set satisfies the one-domain-one-list invariant, so it loads with validation on. The deliberately-conflicting `both@conflict.example` pair lives in ../lists-conflict/ instead.",
   "whitelist": [
     {
       "email": "friend@example.org",
       "friendly_name": "Trusted Friend",
-      "known_structures": [
-        {
-          "name": "ALL EMAILS",
-          "key_phrases": []
-        }
-      ]
-    },
-    {
-      "email": "both@conflict.example",
-      "friendly_name": "Listed Twice (whitelist side)",
+      "tags": ["personal"],
       "known_structures": [
         {
           "name": "ALL EMAILS",

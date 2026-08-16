@@ -1,0 +1,16 @@
+{
+  "_note": "SYNTHETIC test fixture -- DELIBERATELY INVALID. `both@conflict.example` appears here and on the blacklist beside it, which breaks the one-domain-one-list invariant (root README, \"List schemas\"). It exists to lock blacklist-beats-whitelist precedence in the matcher, so it is only ever loaded with `Lists.load(..., validate=False)`, and it doubles as the fixture the exclusivity validator is tested against.",
+  "whitelist": [
+    {
+      "email": "both@conflict.example",
+      "friendly_name": "Listed Twice (whitelist side)",
+      "tags": [],
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

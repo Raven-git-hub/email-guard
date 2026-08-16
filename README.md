@@ -62,7 +62,7 @@ The rules pack contains:
 | Dispatcher (bridge IMAP → scanner) | **Built** — poll-based; runs the scanner as a subprocess, IDLE and per-email containers still to come |
 | Canary (local LLM) semantic checks | **To be built** |
 | Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
-| Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; review UI + applier to be built |
+| Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; the **applier is built** (`email_guard apply`, decisions document in → live lists out). Review UI still to come |
 | Webhook / output sinks + actions | Partially proven; actions not yet in the greylist schema |
 | Admin UI (lists, stats, quarantine, review, approvals) | **To be built** |
 | Unified configuration | **To be built** (replaces conflicting path files + index refs) |
@@ -249,6 +249,7 @@ First match wins:
 | # | Condition | Level |
 |---|-----------|-------|
 | 1 | Blacklist hit | **1** |
+| 1b | Greylist `denied` — a catalogued shape the reviewer marked unwanted | **1** |
 | 2 | Injection detected — the hard-baked floor **or** the level-1 injection signature feed | **1** |
 | 3 | **Not** whitelisted, and either the phishing signature feed matches **or** the subject carries standalone obvious obfuscation (homoglyphs) with no injection payload beneath it | **2** |
 | 4 | Greylist `known` → **4** · `new_structure` → **3** · `none` and not whitelisted → **3** | 4/3/3 |
@@ -263,6 +264,11 @@ Two things worth spelling out:
   qualifier, so a whitelisted address on a *greylisted* domain is judged by whether the
   message shape is catalogued: an uncatalogued one lands at 3 for review rather than being
   waved through at 5.
+- **Rule 1b sits with rule 1, not rule 4.** A denied structure is a blacklist entry scoped
+  to one message shape rather than a whole sender, so it rejects for the same reason and at
+  the same point. It does not breach "triage reads content only": the content → disposition
+  decision belongs to the greylist matcher, and triage still receives only a classification
+  string.
 
 ---
 
@@ -389,6 +395,8 @@ data/daily-brief/daily-brief-<YYYY-MM-DD>/<job>/candidate.json
   quarantine is forensic storage, so what the scanner saw is what a reviewer reads.
 - The verdict gains a `written` section naming every path created; it is `null` under
   `--dry-run`.
+- The verdict carries `tags`: the routing labels of the allowed greylist structure the
+  message matched, empty otherwise. This is what the outbound webhook dispatches on.
 - Re-scanning the same message with the same date **overwrites its own files identically** —
   no timestamps, no run ids, fixed JSON formatting.
 
@@ -410,7 +418,21 @@ python -m email_guard message.eml
 python -m email_guard --from-json sample.json --pretty
 python -m email_guard --from-json sample.json --dry-run       # compute, print, write nothing
 python -m email_guard --validate-rules
+python -m email_guard apply decisions-2026-05-15.json         # the learning loop's other half
 ```
+
+`apply` is the one subcommand, dispatched on the first argument rather than through argparse
+subparsers — subparsers would demand a verb on *every* invocation, turning the documented
+`python -m email_guard message.eml` (which the dispatcher runs) into `… scan message.eml`.
+An `.eml` file actually named `apply` can be scanned as `./apply`.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | success |
+| `1` | unreadable input, or an output that could not be written |
+| `2` | invalid rules pack — refused to scan |
+| `3` | contradictory lists — refused to scan |
+| `4` | invalid decisions document — no list was written |
 
 Paths resolve by **flag > environment > `config/config.json` > built-in default**:
 
@@ -550,18 +572,47 @@ retry queue is still to come.
 ### List schemas (from the live samples)
 
 ```
-whitelist: [ { email, friendly_name, known_structures: [ { name, key_phrases: [] } ] } ]
-blacklist: [ { email, friendly_name?, known_structures: [ ... ] } ]
-greylist:  [ { domain,               known_structures: [ { name, key_phrases: [ "Subject: …", … ] } ] } ]
+whitelist: [ { email|domain, friendly_name, tags: [], known_structures: [ { name, key_phrases: [] } ] } ]
+blacklist: [ { email|domain, friendly_name?,          known_structures: [ ... ] } ]
+greylist:  [ { domain,       tags: [],
+               known_structures: [ { name, key_phrases: [ "Subject: …", … ],
+                                     disposition: "allowed"|"denied", tags: [] } ] } ]
 ```
 
-- Whitelist / blacklist key on **email**; greylist keys on **domain**.
+- Whitelist / blacklist normally key on **email**; greylist always keys on **domain**. A
+  whole-domain white/blacklist entry is legal too — the wizard writes one when the reviewer
+  decides about a domain rather than a correspondent.
 - A structure with empty `key_phrases`, or one named `"ALL EMAILS"`, means **match every
   message from this sender** (the matcher must handle empty phrase sets explicitly).
 - `"Subject: …"` phrases match the subject; other phrases match the body.
 - **Domain matching includes subdomains**: a list entry matches when
   `sender_domain == domain` or `sender_domain` ends with `"." + domain` (so
   `notify.example-bank.test` matches an `example-bank.test` entry).
+
+**`disposition`** — a greylist structure either clears its shape or rejects it.
+
+- `"allowed"` (the **default when the key is absent**, so every list written before
+  dispositions existed keeps its meaning) → the shape is catalogued and fine.
+- `"denied"` → the shape is catalogued and unwanted; it rejects at level 1, exactly like a
+  blacklist entry scoped to one message shape rather than a whole sender.
+- A value that is neither **fails closed to `denied`** and is rejected by the validator, so
+  a typo can never buy trust.
+
+**`tags`** — free-form routing labels on entries and on structures. The matched *allowed*
+structure's tags are carried onto the verdict as `tags`, for the outbound webhook to
+dispatch on. **Tags never affect the threat level**; they say what a message *is*, not how
+dangerous it is.
+
+**One domain, one list.** An address or domain is represented on exactly one of the three
+lists. The lists answer a single question — who is this sender? — and the matcher consults
+them in a fixed order, so a sender on two lists would get a verdict decided by precedence
+rather than by the reviewer. `Lists.load` **fails closed** on a violation, the same way the
+rules pack does; the applier maintains the invariant when it writes.
+
+The invariant is about *keys*, not coverage, and removal is deliberately narrower than
+matching: `phish.bank.example` on the blacklist while `bank.example` is greylisted is a
+refinement the precedence ladder resolves correctly, not a contradiction. Matching broadly
+is defence in depth; deleting broadly is data loss.
 
 ### Storage & privacy
 
@@ -580,9 +631,17 @@ committed** to the repo — which may be published later.
 
 ### Greylist match outcomes
 
-- Message matches a known structure → **known / pass**.
+- Message matches an **allowed** structure → **known / pass** (level 4), carrying that
+  structure's `tags`.
+- Message matches a **denied** structure → **denied / reject** (level 1).
 - Domain present but no structure matches → **new_structure** (surface for review).
 - Domain absent → **unknown** (surface for review).
+
+**Denied wins.** A message matching both an allowed and a denied structure is denied — the
+reviewer catalogued the denied shape precisely to reject it, and a broad `"ALL EMAILS"`
+entry must not override that. Neither the scan over structures nor the scan over covering
+entries short-circuits, because a sender at `notify.bank.example` can be covered by a
+`bank.example` entry and a `notify.bank.example` entry at once.
 
 ### The learning loop (currently over Discord, moving into the UI)
 
@@ -592,15 +651,73 @@ committed** to the repo — which may be published later.
 3. **Review** — once a day the UI shows the batch; each card presents the proposal (the
    Canary can pre-annotate a suggested classification + reason) and lets you choose the
    list, whether to catalogue a new structure, and the action group.
-4. **Apply** — decisions compile into `instructions-{date}.json`, handed to the applier that
-   writes the live lists. Nothing edits the lists without approval.
+4. **Apply** — decisions compile into a **decisions document**, `decisions-{date}.json`,
+   handed to the applier that writes the live lists. Nothing edits the lists without
+   approval.
+
+#### The decisions document
+
+The contract between the review UI and the applier. Emitting one of these is the *only* way
+a live list changes.
+
+```json
+{ "decisions_version": 1, "reviewed": "2026-05-15",
+  "decisions": [
+    { "candidate": "<job-or-domain>",
+      "action": "whitelist" | "greylist" | "blacklist" | "discard",
+      "entry":     { "email"|"domain", "friendly_name"?, "tags": [] },
+      "structure": { "name", "key_phrases": [], "disposition": "allowed"|"denied", "tags": [] } }
+  ] }
+```
+
+- `entry` names the **subject** of the decision and is required for all three list actions
+  — a greylist decision needs a target domain like any other. Exactly one of `email` or
+  `domain`; a greylist `entry` must use `domain`.
+- `structure` is **greylist-only** and says what to catalogue, with its disposition. A
+  greylist decision without one just creates the entry, whose shapes then all come back
+  `new_structure` for review.
+- `discard` drops the candidate and touches nothing.
+
+This mirrors the wizard. A new domain: `action` picks the list; white/black writes a
+match-all entry (plus `tags` for the whitelist); greylist writes or appends the structure.
+A domain already on the greylist is just a greylist decision that appends another structure
+to the existing entry.
+
+#### The applier
+
+```
+python -m email_guard apply decisions-2026-05-15.json [--lists-dir DIR] [--dry-run]
+```
+
+It prints a JSON report of every change to stdout and `wrote <path>` lines to stderr, and it
+owes four guarantees:
+
+- **Mutual exclusivity.** Applying a decision first removes every entry claiming that domain
+  from the other two lists — including address-keyed ones, since an address claims its
+  domain — and logs each removal. The new decision wins; that is what approving it meant.
+- **All-or-nothing.** The whole document is validated before anything is applied, naming the
+  candidate that failed, and the resulting lists are validated in memory before anything is
+  written. One bad decision leaves every file exactly as it was.
+- **Idempotent.** Re-applying a document changes nothing: a structure is appended only when
+  its name is not already on the entry. A structure of the same name whose *content* differs
+  is replaced in place rather than silently dropped — flipping a shape from `allowed` to
+  `denied` is the operation a reviewer most needs once a domain starts sending something
+  nasty.
+- **Atomic.** Each file is written to a temp sibling and renamed, so a crash mid-write cannot
+  truncate a live list. Atomicity is per file; files that only *lost* entries are written
+  first, so a crash between renames leaves a domain on zero lists — re-reviewed at level 3 —
+  rather than on two, which the loader would now refuse.
+
+Hand-edited files round-trip: the `{"greylist": […]}` wrapper, a bare top-level array, and
+sibling keys such as `_note` all survive a rewrite untouched.
 
 ### Actions
 
 Greylisted / cleared mail carries an **action** the downstream workflow dispatches on:
 `finance`, `personal_assistant`, `work`, `calendar`, `summarise`, or none. This is the
-payload the outbound webhook hands to the other machine. *(Not yet present in the greylist
-schema — to be added per domain during the rebuild.)*
+payload the outbound webhook hands to the other machine. *(Still not in the greylist schema.
+The general routing hook now exists — `tags` on entries and structures, surfaced on the
+verdict — and the single `action` enum is to be layered on top of it.)*
 
 ---
 
@@ -645,6 +762,7 @@ email-guard/
 │       ├── canary.py
 │       ├── route.py
 │       ├── propose.py          # writes daily-brief candidates
+│       ├── apply.py            # decisions document in → live lists out
 │       └── outputs.py
 ├── rules/                       # THE RULES PACK — its own version history
 │   ├── scan/                   # level2.json … declarative pattern rules   (fail CLOSED)
@@ -654,7 +772,6 @@ email-guard/
 │   │   └── phishing_signatures.json    # level 2 — deliberately empty
 │   ├── signatures/             # prompt-injection.json  (starts empty)
 │   └── validate.py             # load-time + CI validator (scan rules only)
-├── applier/                     # consumes instructions-{date}.json → writes live lists
 ├── canary/                      # local model service config (e.g. Ollama)
 ├── ui/                          # LAN-only console
 ├── config/
@@ -707,8 +824,10 @@ email-guard/
 8. ~~Build the dispatcher (IMAP → spawn) with concurrency + webhook delivery.~~ **Done**,
    poll-based. Still to do: IMAP `IDLE` for latency, and a durable webhook retry queue.
 9. Formalise output sinks and the **action** payload; add `action` to the greylist schema.
-10. Build the review → applier half of the learning loop, and the Admin UI (the scanner
-    already stages candidates into `daily-brief-{date}/`).
+10. ~~Build the applier half of the learning loop~~ **Done** — `email_guard apply` consumes a
+    decisions document and writes the live lists, with greylist dispositions and tags behind
+    it. Still to do: the review UI that emits the decisions document, and the daily digest
+    that presents the batch.
 11. Wire up consolidated-inbox delivery for `cleared` mail.
 12. Seed the prompt-injection signature DB (Canary-assisted) as real traffic is seen.
 13. Fix the known issues; add a regression corpus of real sample messages.

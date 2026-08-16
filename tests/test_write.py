@@ -210,6 +210,17 @@ def test_a_known_structure_stages_nothing(write, outputs):
     assert not outputs["brief"].exists()
 
 
+def test_a_denied_structure_stages_nothing():
+    """A denied shape is as catalogued as an allowed one -- nothing left to decide."""
+    from email_guard.lists import GREYLIST_DENIED
+    from email_guard.propose import classify
+
+    proposal = classify({"original_sender": "a@x.example"}, GREYLIST_DENIED)
+
+    assert proposal["classification"] == "skip"
+    assert "denied structure" in proposal["reason"]
+
+
 def test_a_blacklisted_sender_stages_nothing(write, outputs):
     """`skip` covers both directions: nothing is proposed for a listed sender."""
     verdict = write(REJECTED_FIXTURE)

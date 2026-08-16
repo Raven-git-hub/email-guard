@@ -4,11 +4,21 @@
     python -m email_guard --from-json sample.json
     python -m email_guard --from-json sample.json --dry-run
     python -m email_guard --validate-rules
+    python -m email_guard apply decisions-2026-08-16.json [--dry-run]
 
 By default a scan now *writes*: the verdict and the original message land in
 ``<outbound_dir>/<bucket>/<job>/``, and an unfamiliar sender or an uncatalogued
 message shape stages a candidate under ``<daily_brief_dir>/daily-brief-<date>/``.
 ``--dry-run`` is the old behaviour -- compute, print, touch nothing.
+
+``apply`` is the other half of the learning loop: it takes an approved decisions
+document and writes the live lists (see :mod:`email_guard.apply`). It is the one
+subcommand, dispatched on the first argument rather than through argparse
+subparsers -- subparsers would demand a verb on *every* invocation, turning the
+documented ``python -m email_guard message.eml`` (which the dispatcher's
+scanner_client runs) into ``... scan message.eml``. That is a breaking change to
+an external interface for the sake of one verb. An .eml file actually named
+``apply`` can be scanned as ``./apply``.
 """
 
 from __future__ import annotations
@@ -20,8 +30,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from . import __version__, config, parse
-from .lists import Lists
+from . import __version__, apply as apply_module
+from . import config, parse
+from .apply import InvalidDecisions
+from .lists import InvalidLists, Lists
 from .pipeline import scan_and_write
 from .route import SourceMessage
 from .rulespack import InvalidRulesPack, RulesPack, run_validator
@@ -29,6 +41,10 @@ from .rulespack import InvalidRulesPack, RulesPack, run_validator
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_INVALID_RULES = 2
+EXIT_INVALID_LISTS = 3
+EXIT_INVALID_DECISIONS = 4
+
+APPLY_COMMAND = "apply"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,7 +94,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_apply_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="email_guard apply",
+        description="Apply an approved decisions document to the live lists.",
+    )
+    parser.add_argument("decisions", metavar="PATH", help="path to a decisions document")
+    parser.add_argument("--config", metavar="PATH", help="path to config.json")
+    parser.add_argument("--lists-dir", metavar="DIR", help="directory holding the live lists")
+    parser.add_argument("--pretty", action="store_true", help="indent the JSON output")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="compute and print the changes without writing any list",
+    )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == APPLY_COMMAND:
+        return _apply_main(args[1:])
+    return _scan_main(args)
+
+
+def _apply_main(argv: list[str]) -> int:
+    parser = build_apply_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        settings = config.load(config_path=args.config, lists_dir=args.lists_dir)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        document = apply_module.load_decisions(args.decisions)
+        result = apply_module.apply_decisions(
+            document, settings.lists_dir, dry_run=args.dry_run
+        )
+    except InvalidDecisions as exc:
+        _report_errors(f"decisions INVALID ({args.decisions})", exc.errors)
+        print("no list was written", file=sys.stderr)
+        return EXIT_INVALID_DECISIONS
+    except OSError as exc:
+        print(f"error: cannot apply decisions: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(dump(result, pretty=args.pretty))
+    for path in result["written"]:
+        print(f"wrote {path}", file=sys.stderr)
+    return EXIT_OK
+
+
+def _scan_main(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -126,7 +195,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --from-json file is not valid JSON: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    lists = Lists.load(settings.lists_dir)
+    # Contradictory lists are refused for the same reason a malformed pack is:
+    # a verdict decided by precedence between two entries the reviewer never
+    # meant to coexist is worse than no verdict at all.
+    try:
+        lists = Lists.load(settings.lists_dir)
+    except InvalidLists as exc:
+        _report_errors(f"lists INVALID ({settings.lists_dir})", exc.errors)
+        print("refusing to scan with contradictory lists", file=sys.stderr)
+        return EXIT_INVALID_LISTS
+
     try:
         verdict = scan_and_write(
             parsed,
@@ -195,8 +273,13 @@ def _validate_only(rules_dir) -> int:
 
 
 def _report_pack_errors(rules_dir, errors: list[str], scanning: bool = True) -> None:
-    print(f"rules pack INVALID ({rules_dir}):", file=sys.stderr)
-    for error in errors:
-        print(f"  - {error}", file=sys.stderr)
+    _report_errors(f"rules pack INVALID ({rules_dir})", errors)
     if scanning:
         print("refusing to scan with an invalid rules pack", file=sys.stderr)
+
+
+def _report_errors(header: str, errors: list[str]) -> None:
+    """The house format for a list of load-time errors: header, then bullets."""
+    print(f"{header}:", file=sys.stderr)
+    for error in errors:
+        print(f"  - {error}", file=sys.stderr)

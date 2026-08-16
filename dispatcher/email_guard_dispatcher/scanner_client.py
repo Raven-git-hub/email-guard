@@ -7,7 +7,8 @@ The contract it codes against (``scanner/email_guard/cli.py``):
 * **stdout is the verdict JSON and nothing else** -- the human "wrote ..." trail
   goes to stderr precisely so stdout stays pipeable.
 * exit ``0`` on success; ``1`` on a config/IO error; ``2`` on an invalid rules
-  pack (and argparse's own usage errors). Anything non-zero is a failure here.
+  pack (and argparse's own usage errors); ``3`` on contradictory lists. Anything
+  non-zero is a failure here, so codes can be added without touching this file.
 
 Note what this module does *not* do: it passes no ``--lists-dir``,
 ``--rules-dir``, ``--outbound-dir`` or ``--daily-brief-dir``. The scanner

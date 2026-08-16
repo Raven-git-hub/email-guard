@@ -3,6 +3,7 @@
     {
       "email": "friend@example.org",
       "friendly_name": "Trusted Friend",
+      "tags": ["personal"],
       "known_structures": [
         {
           "name": "ALL EMAILS",
