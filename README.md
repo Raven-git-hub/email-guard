@@ -500,7 +500,7 @@ The non-secret settings live in the `imap` section of `config/config.json`:
 
 | Key | Meaning |
 |-----|---------|
-| `host` / `port` | Where the bridge listens. `127.0.0.1:1143` is the bridge's default local IMAP. |
+| `host` / `port` | Where the bridge listens. `127.0.0.1:1143` is the bridge's default local IMAP — **but under compose it is `bridge:143`**, see below. |
 | `mailbox` | Which mailbox to watch. |
 | `tls` | `starttls` (the bridge's default), `ssl`, or `none`. |
 | `ca_file` | A CA bundle to verify the bridge certificate against. Usually unnecessary — see below. |
@@ -533,6 +533,24 @@ no network attacker to defend against. On **any other host** the certificate is 
 normally and a self-signed one will be rejected; point `ca_file` at the bridge's certificate
 if you genuinely run it on another machine. Verification is never silently disabled for a
 remote host.
+
+**Under compose, both of those change** — and the committed defaults are already right:
+
+- **The port is `143`, not `1143`.** 1143 is what the bridge listens on inside its own
+  container, and what it publishes to the host when run standalone; the `shenxn` image fronts
+  it with socat and exposes **143** on the container network. The dispatcher reaches it over
+  that network. Using 1143 there gets a flat connection refusal.
+- **That hop runs as `tls=none`.** It sits on a compose network declared `internal: true` —
+  no gateway, no route off the host, nothing else attached — which is the same reasoning that
+  makes the loopback exemption safe.
+
+  It is not a shortcut past a better option, because there is not one yet. The bridge's
+  certificate is issued for `localhost`/`127.0.0.1`, so it fails hostname verification against
+  the service name `bridge` whatever `ca_file` is supplied, and there is deliberately no
+  verify-off switch. Closing that needs a fourth TLS mode — *encrypt, trust this specific
+  certificate, skip the hostname check* — tracked as `TODO(bridge-tls)`. Plaintext on a
+  network with no route out is the honest answer meanwhile; a downgrade that pretended to
+  verify would be worse.
 
 ### 2. Provide the bridge credentials
 
@@ -802,7 +820,9 @@ over plain HTTP, with no password unless you configure one. The default bind is 
 and a non-loopback address is refused unless asked for twice — the host *and*
 `--allow-non-loopback` (or `EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK=1`). That flag exists for
 the container case, where the process must bind `0.0.0.0` for a published port to reach it
-and `docker-compose.yml` pins the publication to `127.0.0.1:8080`.
+and `docker-compose.yml` pins the publication to `127.0.0.1`. The host *port* is configurable
+(`EMAIL_GUARD_WEBUI_HOST_PORT`, default 8080) so the console can move out of the way of
+whatever else already has 8080; the loopback interface is not.
 
 Optional shared-token auth guards every `/api/` route: set `EMAIL_GUARD_WEBUI_TOKEN`, or put
 it in `config/secrets.json` under `webui.token` (git-ignored, like the bridge credentials —
@@ -847,17 +867,18 @@ docker compose up -d                       # bridge + dispatcher + socket-proxy 
 
 `docker compose up -d webui` still brings up the console alone.
 
-The console publishes `127.0.0.1:8080` only and shares the same data volume the dispatcher
-and scanner use, so it reads the candidates they stage and writes the lists they read back.
-Run it as your own uid (`EMAIL_GUARD_UID` / `EMAIL_GUARD_GID`) to keep the lists
-hand-editable afterwards.
+The console publishes to loopback only — `127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}`
+— and shares the same data volume the dispatcher and scanner use, so it reads the candidates
+they stage and writes the lists they read back. Run it as your own uid (`EMAIL_GUARD_UID` /
+`EMAIL_GUARD_GID`) to keep the lists hand-editable afterwards.
 
 **The state file and the data directories live on a named volume**, so a container recreate
 cannot take the done-list with it — losing `data/dispatcher/state.json` would rescan the
 whole mailbox and re-fire every webhook. The volume is bound to a known host directory
 because the dispatcher has to name that host path when mounting into scanner containers.
 
-Two things to know before the first `up`:
+A filled-in `.env` is the whole of the configuration — there is no override file to write
+and nothing tracked to edit. Two things to know before the first `up`:
 
 - **`EMAIL_GUARD_HOST_ROOT` must be this repo's absolute path on the host.** Compose fails
   loudly if it is unset; if it is set but *wrong*, scans fail with a confusing rules-pack
@@ -865,6 +886,14 @@ Two things to know before the first `up`:
 - **The bridge service reuses your existing, already-logged-in Proton Bridge** via
   `EMAIL_GUARD_BRIDGE_CONFIG_DIR`. It does not initialise a new one, and pointing it at an
   empty directory forces the whole account-login and keychain dance again.
+
+The bridge sits on two networks: the `internal: true` `mail` network it shares with the
+dispatcher, and a second `egress` network it needs to reach Proton at all — without egress it
+never authenticates, never opens IMAP, and the dispatcher just sees EOF. The dispatcher stays
+off `egress`.
+
+Expect the dispatcher to log a few `could not connect ...; retrying` lines at startup: it
+comes up alongside the bridge and waits it out with backoff rather than exiting.
 
 Scanner containers are created by the dispatcher, not by compose, so they never appear in
 `docker compose ps`. Find them with `docker ps --filter label=email-guard.role=scanner`.

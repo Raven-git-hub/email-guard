@@ -313,6 +313,9 @@ class FakeMailSource:
     Leave it unset and the call behaves like a server that never pushes, which
     is how the poll backstop gets tested. ``idle_failures`` makes the next N
     waits raise, standing in for a dropped IDLE connection.
+
+    ``connect_failures`` makes the next N ``connect`` calls raise -- a bridge
+    that is still starting up, which is the ordinary case under compose.
     """
 
     def __init__(
@@ -321,12 +324,14 @@ class FakeMailSource:
         uid_validity: str = "1",
         fail_times: int = 0,
         idle_failures: int = 0,
+        connect_failures: int = 0,
     ) -> None:
         self._messages = list(messages or [])
         self._uid_validity = uid_validity
         self.seen: set[str] = set()
         self.fail_times = fail_times
         self.connect_calls = 0
+        self.connect_failures = connect_failures
         self.marked: list[str] = []
         self.notify = threading.Event()
         self.idle_failures = idle_failures
@@ -345,6 +350,9 @@ class FakeMailSource:
 
     def connect(self) -> None:
         self.connect_calls += 1
+        if self.connect_failures > 0:
+            self.connect_failures -= 1
+            raise MailSourceError("simulated connection refused (bridge not ready)")
 
     def close(self) -> None:
         pass

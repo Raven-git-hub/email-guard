@@ -16,6 +16,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Name the config file explicitly rather than relying on `project_root()`
+# (`Path(__file__).parents[2]`), which is /app under the editable install below
+# but the site-packages prefix under a non-editable one. The console would not
+# crash on that -- it would quietly read an empty lists directory under
+# /usr/local and show nothing, which is worse. See dispatcher/Dockerfile.
+ENV EMAIL_GUARD_CONFIG=/app/config/config.json
+
 WORKDIR /app
 
 # The three package roots plus the packaging metadata. `data/` is never copied

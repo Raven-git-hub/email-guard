@@ -265,8 +265,155 @@ def test_the_dispatcher_is_never_given_the_docker_socket():
 
 
 def test_the_review_console_stays_on_loopback():
-    """One character between "localhost only" and "on the LAN"."""
-    assert '"127.0.0.1:8080:8080"' in COMPOSE
+    """The host port moved behind a variable; the loopback bind must not.
+
+    Dropping the `127.0.0.1:` prefix is one character between "localhost only"
+    and "a console that reads mail and edits delivery rules, on the LAN, over
+    plain HTTP". So the port is configurable and the interface is not.
+    """
+    published = [
+        line.strip().lstrip("- ").strip('"')
+        for line in COMPOSE.splitlines()
+        if line.strip().startswith('- "') and ":8080" in line
+    ]
+
+    assert published == ['127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080']
+    assert all(entry.startswith("127.0.0.1:") for entry in published)
+
+
+# -- the compose topology a live bring-up corrected ---------------------------
+#
+# Each of these is a bug that cost a real bring-up. None of them is reachable
+# without a daemon, so what is pinned here is the committed configuration --
+# enough that a silent revert fails a test rather than a deployment.
+
+
+def test_the_bridge_can_reach_proton():
+    """`mail` is internal, so the bridge needs a second, non-internal network.
+
+    On `mail` alone the bridge cannot resolve mail-api.proton.me, never
+    authenticates, never opens its IMAP listener -- and the dispatcher's
+    connection attempts return EOF, which reads like a dispatcher fault and is
+    not one.
+    """
+    compose = _compose()
+
+    assert compose["networks"]["mail"].get("internal") is True
+    assert compose["networks"]["egress"].get("internal") is not True
+    assert "egress" in compose["services"]["bridge"]["networks"]
+
+
+def test_the_dispatcher_has_no_egress():
+    """It needs the bridge and the socket-proxy. Nothing else."""
+    networks = _compose()["services"]["dispatcher"]["networks"]
+
+    assert sorted(networks) == ["dockerproxy", "mail"]
+
+
+def test_the_dispatcher_uses_the_container_network_imap_port():
+    """143 on the container network; 1143 is the in-container/published port.
+
+    The shenxn image fronts the bridge with socat, so the number that works
+    from another container is not the one the Proton Bridge docs quote.
+    """
+    port = _compose()["services"]["dispatcher"]["environment"]["EMAIL_GUARD_IMAP_PORT"]
+
+    assert port == "${EMAIL_GUARD_IMAP_PORT:-143}"
+
+
+def test_the_socket_proxy_can_write_its_own_config():
+    """haproxy renders /tmp/haproxy.cfg at startup; read_only alone crash-loops."""
+    proxy = _compose()["services"]["docker-socket-proxy"]
+
+    assert proxy["read_only"] is True
+    assert "/tmp" in proxy["tmpfs"]
+    assert "/run" in proxy["tmpfs"]
+
+
+def _compose():
+    yaml = pytest.importorskip("yaml", reason="compose assertions need PyYAML")
+    return yaml.safe_load(COMPOSE)
+
+
+# -- config resolution inside an image ----------------------------------------
+#
+# The bug these cover cost a live bring-up. Both config loaders fall back to
+# `project_root()` = `Path(__file__).parents[2]`, which is the repo root from a
+# checkout but the *install prefix* once pip-installed into site-packages. With
+# no config file found there, every relative path in config.json resolves under
+# that prefix: `/usr/local/lib/python3.11/data/lists`. The dispatcher's
+# ContainerRunner self-check caught it; the web UI would have silently read an
+# empty lists directory and shown nothing, which is worse.
+#
+# Naming the file -- EMAIL_GUARD_CONFIG, set as an ENV in both images -- is the
+# fix. What these pin is the property that makes it work: paths resolve against
+# the *config file's* directory, wherever the code itself happens to live.
+
+
+def config_tree(root: Path) -> Path:
+    """An /app-shaped layout: config/config.json with relative data paths."""
+    (root / "config").mkdir(parents=True, exist_ok=True)
+    path = root / "config" / "config.json"
+    path.write_text(
+        '{"lists_dir": "data/lists", "outbound_dir": "data/outbound",'
+        ' "daily_brief_dir": "data/daily-brief", "rules_dir": "rules"}'
+    )
+    return path
+
+
+def test_relative_paths_resolve_against_the_config_not_the_install_prefix(tmp_path):
+    """The dispatcher's loader, pointed at a config far from both cwd and code."""
+    app = tmp_path / "app"
+    path = config_tree(app)
+
+    container = load({"EMAIL_GUARD_CONFIG": str(path)}).container
+
+    assert container.lists_dir == app / "data" / "lists"
+    assert container.outbound_dir == app / "data" / "outbound"
+    assert container.daily_brief_dir == app / "data" / "daily-brief"
+    assert container.rules_dir == app / "rules"
+
+
+def test_the_scanner_loader_resolves_the_same_way(tmp_path, monkeypatch):
+    """The web UI reaches the data directories through this one."""
+    import email_guard.config as scanner_config
+
+    app = tmp_path / "app"
+    path = config_tree(app)
+    monkeypatch.setenv("EMAIL_GUARD_CONFIG", str(path))
+    for stale in ("EMAIL_GUARD_LISTS_DIR", "EMAIL_GUARD_OUTBOUND_DIR",
+                  "EMAIL_GUARD_DAILY_BRIEF_DIR", "EMAIL_GUARD_RULES_DIR"):
+        monkeypatch.delenv(stale, raising=False)
+
+    settings = scanner_config.load()
+
+    assert settings.lists_dir == app / "data" / "lists"
+    assert settings.outbound_dir == app / "data" / "outbound"
+
+
+def test_resolved_paths_never_land_under_the_python_install_prefix(tmp_path):
+    """The actual failure signature, asserted directly.
+
+    `/usr/local/lib/python3.11/data/lists` is what a container produced before
+    EMAIL_GUARD_CONFIG was set, and it is the shape to stay away from.
+    """
+    import sys
+
+    path = config_tree(tmp_path / "app")
+    container = load({"EMAIL_GUARD_CONFIG": str(path)}).container
+
+    prefix = Path(sys.prefix).resolve()
+    for name in ("lists_dir", "outbound_dir", "daily_brief_dir", "rules_dir", "data_dir"):
+        resolved = getattr(container, name).resolve()
+        assert prefix not in resolved.parents, f"{name} resolved under the install prefix"
+
+
+def test_both_images_name_the_config_file_explicitly():
+    """It belongs in the image, so it holds however the image is run."""
+    root = DISPATCHER_PACKAGE.parents[1]
+    for dockerfile in ("dispatcher/Dockerfile", "webui/Dockerfile"):
+        text = (root / dockerfile).read_text(encoding="utf-8")
+        assert "EMAIL_GUARD_CONFIG=/app/config/config.json" in text, dockerfile
 
 
 # -- the ground rule ----------------------------------------------------------

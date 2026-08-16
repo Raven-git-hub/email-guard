@@ -24,6 +24,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# EMAIL_GUARD_CONFIG is load-bearing, and its absence was a real bring-up
+# failure rather than a theoretical one.
+#
+# Both config loaders fall back to `project_root()`, defined as
+# `Path(__file__).parents[2]`. That is the repo root when running from a
+# checkout -- but `/usr/local/lib/python3.11` once the package is pip-installed
+# into site-packages. No config file exists there, so every *relative* path in
+# config.json resolves against that prefix instead of /app, and the dispatcher
+# goes looking for `/usr/local/lib/python3.11/data/lists`.
+#
+# ContainerRunner's startup self-check catches it loudly ("lists_dir ... is
+# outside the data root"), but naming the file is the actual fix -- and it
+# belongs in the image, so it holds however the image is run, not only under
+# the compose file that happens to set it.
+ENV EMAIL_GUARD_CONFIG=/app/config/config.json
+
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /app

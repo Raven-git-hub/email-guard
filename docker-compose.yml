@@ -37,7 +37,19 @@ services:
     image: shenxn/protonmail-bridge:latest
     container_name: email-guard-bridge
     restart: unless-stopped
-    networks: [mail]
+    # Two networks, and it needs both.
+    #
+    # `mail` is internal and carries the dispatcher<->bridge IMAP hop. `egress`
+    # is NOT internal, and the bridge cannot work without it: it has to reach
+    # Proton to authenticate. On `mail` alone it fails DNS
+    # ("lookup mail-api.proton.me ... server misbehaving"), never authenticates,
+    # never opens its IMAP listener, and the dispatcher's connection attempts
+    # get EOF -- a failure that looks like a dispatcher bug and is not one.
+    #
+    # The dispatcher stays off `egress` deliberately: it needs the bridge and
+    # the socket-proxy, and nothing else. (If you set dispatcher.webhook_url to
+    # something off-host, it will need `egress` added here too.)
+    networks: [mail, egress]
     volumes:
       # The existing, already-logged-in bridge state. Read-write: the bridge
       # refreshes its own tokens. See VALIDATION.md before first start -- a
@@ -82,14 +94,39 @@ services:
       EMAIL_GUARD_HOST_RULES_DIR: "${EMAIL_GUARD_HOST_ROOT}/rules"
       EMAIL_GUARD_CONTAINER_USER: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
 
-      # The bridge is a service name here, not 127.0.0.1, so its self-signed
-      # certificate is no longer covered by the loopback exemption and must be
-      # verified properly. Point this at the cert the bridge generated (it
-      # lives in the config directory mounted above). VALIDATION.md covers
-      # finding it, and the documented fallback if you cannot.
       EMAIL_GUARD_IMAP_HOST: "bridge"
-      EMAIL_GUARD_IMAP_PORT: "1143"
-      EMAIL_GUARD_IMAP_TLS: "${EMAIL_GUARD_IMAP_TLS:-starttls}"
+
+      # 143, not 1143. Those are two different things and mixing them up gets
+      # you a flat connection refusal:
+      #
+      #   * 1143 is what the bridge listens on *inside* its own container, and
+      #     what it publishes to the HOST when run standalone. Every Proton
+      #     Bridge document quotes 1143 for that reason.
+      #   * 143 is what the shenxn image exposes on the container network -- it
+      #     runs socat in front, forwarding 143 to the bridge's own 1143.
+      #
+      # The dispatcher reaches the bridge over `mail`, so it wants the
+      # container-network port.
+      EMAIL_GUARD_IMAP_PORT: "${EMAIL_GUARD_IMAP_PORT:-143}"
+
+      # Plaintext on this hop, by default and on purpose.
+      #
+      # `mail` is `internal: true`: no route off this host, no gateway, nothing
+      # else attached but these two containers. The exposure is comparable to
+      # loopback, which is the same reasoning that lets the dispatcher accept
+      # the bridge's self-signed certificate over 127.0.0.1.
+      #
+      # TODO(bridge-tls): an *encrypted* internal hop is not currently
+      # reachable. The bridge's self-signed certificate is issued for
+      # `localhost` / `127.0.0.1`, so verification against the service name
+      # `bridge` fails on hostname mismatch no matter which CA file is
+      # supplied -- and there is deliberately no verify-off switch, because
+      # `build_ssl_context` refuses to silently downgrade a non-loopback host.
+      # Closing this needs a third TLS mode meaning "encrypt, trust this
+      # specific certificate, skip the hostname check". Until then, plaintext
+      # on a network with no route out is the honest option; a downgrade that
+      # pretended to verify would be worse.
+      EMAIL_GUARD_IMAP_TLS: "${EMAIL_GUARD_IMAP_TLS:-none}"
       EMAIL_GUARD_IMAP_CA_FILE: "${EMAIL_GUARD_IMAP_CA_FILE:-}"
       EMAIL_GUARD_IMAP_MAILBOX: "${EMAIL_GUARD_IMAP_MAILBOX:-INBOX}"
 
@@ -164,6 +201,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     read_only: true
     tmpfs:
+      # Both, and /tmp is the one that matters: the proxy's entrypoint renders
+      # its haproxy config to /tmp/haproxy.cfg at startup, so a read-only
+      # rootfs without this crash-loops on
+      # "can't create /tmp/haproxy.cfg: Read-only file system".
+      # The point of read_only stands -- these are the only writable paths, and
+      # both vanish with the container.
+      - /tmp
       - /run
     security_opt:
       - no-new-privileges:true
@@ -188,7 +232,11 @@ services:
       EMAIL_GUARD_WEBUI_TOKEN: "${EMAIL_GUARD_WEBUI_TOKEN:-}"
 
     ports:
-      - "127.0.0.1:8080:8080"
+      # The container port stays 8080; only the HOST side is configurable, so
+      # the console can move out of the way of whatever else already has 8080.
+      # The `127.0.0.1:` prefix is not configurable, and is the whole exposure
+      # story -- drop it and this console is on the LAN.
+      - "127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080"
 
     volumes:
       # The same data the dispatcher and the scanner use: the console reads the
@@ -224,13 +272,19 @@ services:
     image: email-guard-scanner:0.1.0
 
 networks:
-  # The bridge and the dispatcher. Internal: the bridge has no business being
-  # reachable from anywhere else, and neither does this link.
+  # The dispatcher <-> bridge IMAP hop, and nothing else. Internal: no route
+  # off this host, which is what makes plaintext on it defensible.
   mail:
     internal: true
   # The dispatcher and the socket-proxy, and nothing else on the host.
   dockerproxy:
     internal: true
+  # The bridge's route to Proton. Ordinary bridge driver, deliberately NOT
+  # internal -- the bridge cannot authenticate without egress, and an
+  # internal-only bridge fails DNS and never opens its IMAP listener at all.
+  # Only the bridge is attached.
+  egress:
+    driver: bridge
 
 volumes:
   # A named volume, so `docker compose down` and a container recreate cannot

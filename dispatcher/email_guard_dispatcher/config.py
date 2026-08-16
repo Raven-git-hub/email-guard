@@ -178,6 +178,17 @@ class ImapSettings:
         host. Accepting it anywhere else would not be, so a non-loopback host
         with no ``ca_file`` gets ordinary verification and is allowed to fail
         loudly rather than being silently downgraded.
+
+        TODO(bridge-tls): there is currently no way to encrypt the hop when the
+        bridge is reached by a *name* rather than by loopback, which is what
+        compose does (``bridge:143`` over an internal network). The bridge's
+        certificate is issued for ``localhost``/``127.0.0.1``, so it fails
+        hostname verification against ``bridge`` no matter which ``ca_file`` is
+        supplied, and there is deliberately no verify-off switch here. The
+        compose deployment therefore runs that hop as ``tls=none`` on a network
+        with no route off the host -- honest, and better than a downgrade
+        pretending to verify. Closing this properly means a fourth mode:
+        encrypt, pin/trust this specific certificate, skip the hostname check.
         """
         if self.tls == TLS_NONE:
             return None

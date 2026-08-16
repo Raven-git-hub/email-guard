@@ -244,17 +244,39 @@ class Runner:
         """
         stop = stop or threading.Event()
         backoff = self.reconnect_backoff_seconds
-        self._connect()
+        connected = False
 
         while not stop.is_set():
+            # Connecting is part of the loop, not a prelude to it. The first
+            # connect is exactly as likely to fail as any later one -- under
+            # compose the dispatcher starts alongside the bridge and will beat
+            # it to readiness, so a first attempt that raises ConnectionRefused
+            # or an EOF abort is ordinary startup, not a fatal condition. It
+            # used to escape this method and kill the process, leaving the
+            # container runtime's `restart: unless-stopped` to retry at its own
+            # coarse cadence.
+            if not connected:
+                try:
+                    self._connect()
+                except Exception as exc:  # noqa: BLE001 - the loop must not die
+                    log.warning("could not connect (%s); retrying in %.0fs", exc, backoff)
+                    if stop.wait(backoff):
+                        break
+                    backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF)
+                    continue
+                connected = True
+                backoff = self.reconnect_backoff_seconds
+
             try:
                 report = self.drain_once()
             except Exception as exc:  # noqa: BLE001 - the loop must not die
+                # One recovery path for both failure modes: drop the connection
+                # and let the top of the loop rebuild it under the same backoff.
                 log.warning("drain failed (%s); reconnecting in %.0fs", exc, backoff)
+                connected = False
                 if stop.wait(backoff):
                     break
                 backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF)
-                self._reconnect()
                 continue
 
             backoff = self.reconnect_backoff_seconds
@@ -282,18 +304,15 @@ class Runner:
         stop.wait(timeout)
 
     def _connect(self) -> None:
+        """Open the source, if it is the kind that needs opening.
+
+        Raises on failure by design -- :meth:`run_forever` owns the retry, and
+        that is the only place that should. ``ImapMailSource.connect`` closes
+        any existing connection first, so this doubles as the reconnect.
+        """
         connect = getattr(self.source, "connect", None)
         if callable(connect):
             connect()
-
-    def _reconnect(self) -> None:
-        reconnect = getattr(self.source, "reconnect", None)
-        if not callable(reconnect):
-            return
-        try:
-            reconnect()
-        except Exception as exc:  # noqa: BLE001 - next iteration backs off again
-            log.warning("reconnect failed: %s", exc)
 
 
 def describe(results: Iterable[MessageResult]) -> str:

@@ -191,6 +191,61 @@ def test_a_source_that_cannot_idle_at_all_still_drains(scanner, state):
     assert state.count(source.uid_validity) == len(MAILBOX)
 
 
+def test_a_bridge_that_is_not_ready_yet_is_waited_out_not_fatal(source, scanner, state):
+    """The dispatcher starts alongside the bridge and will usually beat it.
+
+    The first connect used to escape ``run_forever`` and kill the process, so a
+    bridge still authenticating with Proton produced a crash-looping dispatcher
+    that only recovered at the container runtime's own restart cadence. It is
+    ordinary startup, and it belongs in the same retry/backoff as any later
+    reconnect.
+    """
+    source.connect_failures = 3
+    runner = build_runner(
+        source, scanner, state, poll_interval_seconds=0.01, reconnect_backoff_seconds=0.01
+    )
+
+    run_until_drains(runner, drains=1)
+
+    assert source.connect_failures == 0, "the failing connects were not all attempted"
+    assert source.connect_calls == 4, "expected three refusals then a success"
+    assert state.count(source.uid_validity) == len(MAILBOX)
+
+
+def test_a_connect_that_never_succeeds_still_stops_on_request(source, scanner, state):
+    """Retrying forever must not mean ignoring SIGTERM forever."""
+    source.connect_failures = 10_000
+    runner = build_runner(
+        source, scanner, state, poll_interval_seconds=0.01, reconnect_backoff_seconds=0.01
+    )
+    stop = threading.Event()
+    finished = threading.Event()
+
+    def loop():
+        runner.run_forever(stop)
+        finished.set()
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    stop.set()
+
+    assert finished.wait(5), "run_forever ignored stop while retrying the connect"
+
+
+def test_a_mid_run_failure_rebuilds_the_connection(source, scanner, state):
+    """One recovery path for both failure modes."""
+    source.fail_times = 2
+    runner = build_runner(
+        source, scanner, state, poll_interval_seconds=0.01, reconnect_backoff_seconds=0.01
+    )
+
+    run_until_drains(runner, drains=1)
+
+    # Initial connect, plus one rebuild per failed drain.
+    assert source.connect_calls == 3
+    assert state.count(source.uid_validity) == len(MAILBOX)
+
+
 def test_stop_during_the_wait_ends_the_loop(source, scanner, state):
     """SIGTERM must not sit behind a 25-minute IDLE."""
     runner = build_runner(source, scanner, state, poll_interval_seconds=600)

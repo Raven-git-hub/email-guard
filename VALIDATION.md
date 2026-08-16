@@ -52,24 +52,37 @@ lists and reports stay hand-editable afterwards. **They must not be 0** — the
 dispatcher's uid becomes the scanner container's uid, and `ContainerRunner`
 refuses to start as root rather than quietly producing root sandboxes.
 
-### TLS to the bridge
+If host port 8080 is already taken, set `EMAIL_GUARD_WEBUI_HOST_PORT` — only
+the host side moves, and the publication stays loopback-only either way.
 
-Under compose the bridge is reached at the service name `bridge`, not
-`127.0.0.1`, so the loopback exemption that lets its self-signed certificate
-through no longer applies and verification is enforced. Copy the bridge's
-certificate into the repo and name it:
+**No override file, no edits to tracked files.** A filled-in `.env` is the
+whole of the configuration; everything else is committed.
 
-```sh
-cp "$EMAIL_GUARD_BRIDGE_CONFIG_DIR"/cert.pem config/bridge-cert.pem   # path varies
-# in .env:
-EMAIL_GUARD_IMAP_CA_FILE=/app/config/bridge-cert.pem
-```
+### The bridge connection — leave the defaults alone
 
-The exact filename inside the bridge config directory is one of the things this
-runbook cannot state with certainty — look for a `cert.pem` / `*.crt`. If you
-cannot locate it, `EMAIL_GUARD_IMAP_TLS=none` is the documented fallback: that
-hop is an `internal: true` network with no route off the host, but it *is* a
-downgrade and the bridge password crosses it. Prefer the CA file.
+Two values are already correct in the committed compose and are the two most
+likely to be "fixed" into being wrong:
+
+**Port 143, not 1143.** Both are real. 1143 is what the bridge listens on
+inside its own container and publishes to the host when run standalone, which
+is why the Proton Bridge documentation quotes it everywhere. The shenxn image
+runs socat in front, exposing **143** on the container network. The dispatcher
+reaches the bridge over that network, so 143 is the one that works; 1143 gets a
+flat connection refusal.
+
+**`tls=none` on that hop, deliberately.** The `mail` network is
+`internal: true` — no gateway, no route off the host, nothing attached but
+those two containers — which is the same reasoning that lets the dispatcher
+accept the bridge's self-signed certificate over loopback.
+
+It is not a shortcut past a better option, because there isn't one yet. The
+bridge's certificate is issued for `localhost` / `127.0.0.1`, so verifying it
+against the service name `bridge` fails on hostname mismatch whatever CA file
+you supply — and the dispatcher deliberately has no verify-off switch, because
+it refuses to silently downgrade verification for a non-loopback host. Closing
+that gap needs a TLS mode meaning "encrypt, trust this specific certificate,
+skip the hostname check"; it is tracked as `TODO(bridge-tls)` in
+`docker-compose.yml` and in `ImapSettings.build_ssl_context`.
 
 ---
 
@@ -103,8 +116,15 @@ docker compose logs -f dispatcher
 ```
 
 Four services should be up: `bridge`, `dispatcher`, `docker-socket-proxy`,
-`webui`. In the dispatcher's log, look for these three lines before any mail
-moves:
+`webui`.
+
+**Expect the dispatcher to log connection failures for the first few seconds.**
+It starts alongside the bridge and will usually beat it to readiness, so
+`could not connect (...); retrying in 2s` is normal startup, not a fault — it
+backs off and waits the bridge out rather than exiting. What is *not* normal is
+that message continuing indefinitely; see the diagnosis section.
+
+In the dispatcher's log, look for these three lines before any mail moves:
 
 ```
 container runner: image=email-guard-scanner:0.1.0 user=1000:1000 caps: memory=512m pids=128 cpus=1.0
@@ -220,7 +240,7 @@ the next drain would rescan the whole mailbox and re-fire every webhook.
 **The console sees it:**
 
 ```sh
-open http://127.0.0.1:8080/
+open "http://127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}/"
 ```
 
 **On-arrival latency.** Send a second message and watch the timestamps. The
@@ -302,6 +322,72 @@ rootless Docker the daemon's filesystem view is not the host's, and under
 Docker Desktop (macOS/Windows) bind sources are resolved inside the VM. Neither
 was available to test against; if either is in play, treat the manual
 `docker run` above as the authoritative check before trusting the stack.
+
+### The dispatcher never connects: `EOF`, or connection refused, forever
+
+Two different causes, and the logs distinguish them.
+
+**`EOF` / `abort: socket error: EOF`** almost always means the bridge is up but
+has never authenticated, so its IMAP listener is not accepting sessions. Check
+the bridge, not the dispatcher:
+
+```sh
+docker compose logs bridge | grep -i "proton\|lookup\|login\|listen"
+```
+
+`lookup mail-api.proton.me ... server misbehaving` means the bridge has no
+egress. It must be on the non-internal `egress` network as well as `mail` —
+that is committed, so if it is missing, something overrode it:
+
+```sh
+docker inspect email-guard-bridge -f '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}'
+```
+
+Expect both `..._mail` and `..._egress`.
+
+**`ConnectionRefused`** with a healthy, authenticated bridge is usually the
+port. It must be **143** over the container network, not 1143 — see "The bridge
+connection" above. Confirm what the dispatcher is actually using and that the
+port answers:
+
+```sh
+docker compose exec dispatcher printenv EMAIL_GUARD_IMAP_PORT
+docker compose exec dispatcher python -c \
+  "import socket;s=socket.create_connection(('bridge',143),5);print(s.recv(100))"
+```
+
+A `* OK` greeting means the hop is fine.
+
+### The socket-proxy restarts in a loop
+
+```sh
+docker compose logs docker-socket-proxy | tail -20
+```
+
+`can't create /tmp/haproxy.cfg: Read-only file system` means the `tmpfs` entries
+are missing. The proxy renders its haproxy config at startup, so it needs
+writable `/tmp` and `/run` even though — and this is the point — its root
+filesystem stays read-only. Both are committed.
+
+### The web UI shows nothing, or the dispatcher reports a path under `/usr/local`
+
+The signature is a path like `/usr/local/lib/python3.11/data/lists`. Both config
+loaders fall back to `Path(__file__).parents[2]`, which is the repo root from a
+checkout but the *install prefix* inside an image — so with no config file
+found, every relative path in `config.json` resolves under that prefix.
+
+The dispatcher fails loudly on it (`lists_dir ... is outside the data root`);
+the console would just quietly show an empty queue. Both images set
+`EMAIL_GUARD_CONFIG=/app/config/config.json` to prevent it. Verify:
+
+```sh
+docker compose exec dispatcher printenv EMAIL_GUARD_CONFIG
+docker compose exec webui printenv EMAIL_GUARD_CONFIG
+docker compose exec webui ls /app/config/config.json
+```
+
+If the variable is set but the file is missing, the bind mount of
+`./config/config.json` did not land.
 
 ### The scanner writes nothing, and the report never appears
 
