@@ -241,7 +241,10 @@ def test_level2_return_path_alignment(pack):
     context = {"senderDomain": "northgate-bank.example"}
 
     assert func("<owner+SRS=y=DM=northgate-bank.example=z@example.net>", {}, context) == "pass"
-    assert func("<attacker@evil.example>", {}, context) == "fail_critical"
+    # Misalignment is a weak, supporting signal -- never grounds to reject on
+    # its own, since every message here is forwarded and the envelope belongs
+    # to the forwarder.
+    assert func("<attacker@evil.example>", {}, context) == "fail_pass"
     # No sender domain to compare against -- the prototype passes.
     assert func("<anything>", {}, {"senderDomain": ""}) == "pass"
 
@@ -328,9 +331,10 @@ def test_level2_return_path_is_srs_aware(pack):
     srs = "<owner+SRS=7AqCh=DM=northgate-bank.example=payments@example.net>"
     assert func(srs, {}, dict(context)) == "pass"
 
-    # SRS naming a different organisation entirely is still a forgery signal.
+    # SRS naming a different organisation entirely is still a signal -- but a
+    # contributing one, not a verdict.
     wrong = "<owner+SRS=x=DM=evil.example=a@example.net>"
-    assert func(wrong, {}, dict(context)) == "fail_critical"
+    assert func(wrong, {}, dict(context)) == "fail_pass"
 
 
 def test_level2_return_path_non_srs_behaviour_is_unchanged(pack):
@@ -339,7 +343,7 @@ def test_level2_return_path_non_srs_behaviour_is_unchanged(pack):
     context = {"senderDomain": "pay.northgate-bank.example"}
 
     assert func("<payments@pay.northgate-bank.example>", {}, dict(context)) == "pass"
-    assert func("<attacker@evil.example>", {}, dict(context)) == "fail_critical"
+    assert func("<attacker@evil.example>", {}, dict(context)) == "fail_pass"
     # No sender domain to compare against -- the prototype passes.
     assert func("<anything>", {}, {"senderDomain": ""}) == "pass"
 

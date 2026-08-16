@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "updated": "2026-08-16",
+  "description": "Level-2 phishing-language reference signatures. A hit sets level 2 for a sender who is NOT whitelisted; a whitelisted sender is unaffected. Deliberately near-empty at the floor: level 2 is a suspicion, not a rejection, but a noisy entry here flags real mail for every unknown sender, and unknown senders are the common case. Grow this from observed traffic (Canary-assisted) rather than from generic spam phrasing -- 'verify your account' alone appears in plenty of genuine mail. An empty signatures list is valid and means triage runs on identity and the injection floor alone.",
+  "signatures": []
+}

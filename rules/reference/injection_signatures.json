@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "updated": "2026-08-16",
+  "description": "Level-1 prompt-injection reference signatures. A hit sends a message straight to level 1 REGARDLESS of whitelist status -- no legitimate correspondent embeds instructions aimed at a downstream model, so a whitelisted sender that does has been spoofed or compromised. That severity is why every entry must be HIGH PRECISION: a false positive here rejects real mail from a trusted contact, with no list to appeal to. In particular each pattern requires an instruction-shaped OBJECT rather than the bare verb -- 'disregard the previous email' and 'forget everything you know about insurance' are ordinary business and marketing phrasing, while 'disregard the previous instructions' is not. Prefer missing an attack to flagging a receipt: the deep scan and the Canary both get a look afterwards. Phrasing only; anything needing headers or structure belongs in the deep scan. This feed is additive to the hard-baked floor in scanner/email_guard/triage.py, which stays in force if this file is missing or unreadable.",
+  "signatures": [
+    {
+      "id": "inj-0001",
+      "type": "regex",
+      "pattern": "ignore\\s+(all\\s+)?(the\\s+)?(previous|prior|earlier|above|foregoing)\\s+(instructions|prompts|directions|rules|commands)",
+      "description": "The canonical override phrasing, tolerant of the usual variations."
+    },
+    {
+      "id": "inj-0002",
+      "type": "regex",
+      "pattern": "disregard\\s+(all\\s+)?(the\\s+)?(above|previous|prior|earlier|foregoing)\\s+(instructions|prompts|directions|rules|commands)",
+      "description": "Same intent as inj-0001, phrased as a dismissal. The trailing object is required: 'please disregard the previous email' is a routine correction notice."
+    },
+    {
+      "id": "inj-0003",
+      "type": "regex",
+      "pattern": "you\\s+are\\s+now\\s+(an?\\s+)?(unrestricted|unfiltered|uncensored|unbound|jailbroken|amoral|in\\s+developer\\s+mode|DAN\\b)",
+      "description": "Persona reassignment. The bare 'you are now' is far too broad -- 'you are now subscribed' and 'you are now following' are everyday notification copy -- so a jailbreak-shaped object is required."
+    },
+    {
+      "id": "inj-0004",
+      "type": "regex",
+      "pattern": "(forget|erase|discard)\\s+(all\\s+)?(your\\s+)?(previous|prior|earlier)\\s+(instructions|prompts|rules|training|context)",
+      "description": "Instruction to discard prior context. Requires the object: 'forget everything you know about X' is a marketing opener."
+    },
+    {
+      "id": "inj-0005",
+      "type": "regex",
+      "pattern": "new\\s+system\\s+(instructions|prompt|message)\\s*:",
+      "description": "Announces a replacement instruction block. 'system' is required -- a bare 'New instructions:' is ordinary operational mail."
+    },
+    {
+      "id": "inj-0006",
+      "type": "literal",
+      "pattern": "do not tell the user",
+      "description": "Concealment instruction -- asks the model to hide its behaviour from the reader. Specific enough to stand as a literal."
+    },
+    {
+      "id": "inj-0007",
+      "type": "regex",
+      "pattern": "(?:^|[^a-z])(system|assistant)\\s*prompt\\s*(?:override|injection|:)",
+      "description": "Explicit reference to overriding the system prompt."
+    }
+  ]
+}

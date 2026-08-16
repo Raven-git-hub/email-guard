@@ -58,7 +58,7 @@ The rules pack contains:
 | Detection logic (levels 2–4) | Exists in prototype (JS strings), to re-express as a rules pack |
 | Source cleaners (Outlook / Gmail / Proton) | Provided; contracts to be standardised |
 | Triage / initial level assignment | Exists; greylist matching to be updated to current schema |
-| Prompt-injection signature DB | **Does not exist yet** — starts empty, grows over time |
+| Signature reference DB (`rules/reference/`) | **Scaffolded** — injection feed seeded, phishing feed empty by design; static loader that fails open. Interval-pulling from git not built |
 | Dispatcher (bridge IMAP → scanner) | **Built** — poll-based; runs the scanner as a subprocess, IDLE and per-email containers still to come |
 | Canary (local LLM) semantic checks | **To be built** |
 | Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
@@ -179,7 +179,9 @@ cleaner returns a different shape from the Outlook/Gmail cleaners — to be reco
 
 1. **Clean.** Header fingerprints pick Outlook / Gmail / Proton; the matching cleaner
    normalises the message into the shape above.
-2. **Triage — initial level** from list hits and obvious signals.
+2. **Triage — initial level** from list hits and message *content* only (title + body text).
+   A lenient face-value guess; technical signals are not consulted here. See "Threat level
+   model" below.
 3. **Deep scan.** The rules pack for the triage level runs point-by-point over every field,
    each rule returning a status (`pass`, `pass_service`, `fail_pass`, `fail_critical`).
 4. **Canary (conditional).** For level 1–2, cleaned text → local LLM → semantic verdict fed
@@ -211,6 +213,133 @@ to cleared.
 | **5** | Trusted whitelist (no attachments) | `cleared` |
 
 `cleared` → consolidated inbox (tagged with an action); `flagged`/`rejected` → quarantine.
+
+### Three kinds of signal, three owners
+
+The stages do not share evidence, and that separation is deliberate:
+
+| Signal | Examples | Owner |
+|--------|----------|-------|
+| **Content** | subject text, cleaned body text, injection phrasing, homoglyphs | **Triage** |
+| **Technical** | DKIM, return path, multipart structure, header counts, mailer strings | **Deep scan** |
+| **Identity** | who the sender is, which domains are recognised | **The lists** |
+
+**Triage reads message content only** — the title and the cleaned body. It must never read
+`metadata.technical`, `integrity.dkim_verified` or the return path.
+
+Triage is a **lenient face-value guess, not a line of defence**. Everything it assigns above
+level 1 is revisited by the deep-scan loop, which can move a message in either direction, so
+triage only rejects outright on signals that are unambiguous.
+
+An earlier ladder had a "weak infrastructure" rule here that pushed a message to level 2 for
+being single-part, or unverified by DKIM, or having a misaligned return path. Those are
+technical signals; they are wrong far more often than they are right — all mail here is
+forwarded through the bridge, which rewrites exactly those fields — and the deep scan already
+weighs them with proper context. An ordinary plain-text receipt from an unknown domain is a
+level 3 to be looked at, not a level 2 suspect. That branch is gone.
+
+For the same reason the level-2 `return_path_alignment` check was demoted from `fail_critical`
+to `fail_pass`: envelope misalignment is defense-in-depth, contributing to a picture built
+from several signals, never grounds to reject by itself.
+
+### The triage ladder
+
+First match wins:
+
+| # | Condition | Level |
+|---|-----------|-------|
+| 1 | Blacklist hit | **1** |
+| 2 | Injection detected — the hard-baked floor **or** the level-1 injection signature feed | **1** |
+| 3 | **Not** whitelisted, and either the phishing signature feed matches **or** the subject carries standalone obvious obfuscation (homoglyphs) with no injection payload beneath it | **2** |
+| 4 | Greylist `known` → **4** · `new_structure` → **3** · `none` and not whitelisted → **3** | 4/3/3 |
+| 5 | Whitelist hit | **4** with attachments, else **5** |
+
+Two things worth spelling out:
+
+- **Rule 2 fires regardless of whitelist status.** No legitimate sender embeds instructions
+  aimed at a downstream model, so a whitelisted address that does has been spoofed or
+  compromised — precisely when trusting the list would be worst.
+- **Rule 4 runs before rule 5.** Only its `none` arm carries the "and not whitelisted"
+  qualifier, so a whitelisted address on a *greylisted* domain is judged by whether the
+  message shape is catalogued: an uncatalogued one lands at 3 for review rather than being
+  waved through at 5.
+
+---
+
+## Signature reference database
+
+Detection *phrasing* changes far more often than detection *logic*, so it lives apart from
+both the engine and the scan rules, as plain reference data under `rules/reference/`:
+
+```
+rules/reference/
+├── injection_signatures.json    # level 1 — prompt-injection phrasing
+└── phishing_signatures.json     # level 2 — phishing language
+```
+
+### Schema
+
+```json
+{
+  "version": 1,
+  "updated": "2026-08-16",
+  "description": "what this feed is for",
+  "signatures": [
+    {
+      "id": "inj-0001",
+      "type": "regex",
+      "pattern": "ignore\\s+(all\\s+)?(the\\s+)?(previous|prior)\\s+(instructions|prompts)",
+      "description": "why this entry exists"
+    }
+  ]
+}
+```
+
+`type` is `literal` (case-insensitive substring) or `regex` (case-insensitive search).
+
+**Injection entries must be high precision.** A hit is level 1, which rejects the message even
+from a whitelisted sender, with no list to appeal to. Every seeded pattern therefore requires
+an instruction-shaped *object* rather than the bare verb: `disregard the previous email` and
+`forget everything you know about insurance` are ordinary business and marketing phrasing,
+while `disregard the previous instructions` is not. Prefer missing an attack to flagging a
+receipt — the deep scan and the Canary both get a look afterwards.
+
+**The phishing feed ships empty**, on purpose. Level 2 is a suspicion rather than a rejection,
+but a noisy entry there flags real mail for *every* non-whitelisted sender, and unknown
+senders are the common case. Grow it from observed traffic (Canary-assisted), not from generic
+spam phrasing.
+
+### The feed fails OPEN — the scan rules fail CLOSED
+
+The two halves of the pack behave in opposite ways, and this is the design:
+
+| | On a malformed file |
+|---|---|
+| **Scan rules** (`rules/scan/`, `rules/assess/`) | **Fail closed.** `rules/validate.py` rejects the pack, `InvalidRulesPack` is raised, the scanner refuses to score anything. A broken rule could silently mis-score every message, so not running is safer. |
+| **Signature feeds** (`rules/reference/`) | **Fail open.** A file that is missing, empty, unparseable or malformed logs a warning, is skipped, and triage carries on against its hard-baked floor. |
+
+The feeds are the part most likely to be half-written by a future auto-update, and a bad fetch
+must cost sensitivity, not stop the mail. Making the feeds fail closed would let a truncated
+download halt every scan; making the scan rules fail open would let a typo quietly disable
+detection. **Do not unify them.**
+
+One bad *entry* costs that entry, not the whole feed — a signature with an invalid regex, an
+unknown `type` or a duplicate `id` is skipped with a warning and the rest still load.
+
+Resolution order, highest first:
+
+1. the validated file under `rules/reference/`
+2. *TODO(cache):* a last-known-good copy of the last feed that loaded cleanly, so a bad update
+   degrades to yesterday's signatures rather than all the way to the baseline. Not implemented
+   — there is nowhere to cache to until the interval pull exists.
+3. nothing — triage falls back to the hard-baked markers in `scanner/email_guard/triage.py`
+   (`_ROLEPLAY_RE`, `_HIDDEN_UNICODE_RE`, `_FENCE_RE`). These are a permanent floor, not a
+   default the feed replaces: the feed only ever adds to them.
+
+> **TODO(feed-pull):** pulling this repository on an interval so signature updates land without
+> a redeploy is the intended operating mode, and is what the fail-open behaviour above exists
+> to protect. **Not built.** Today the loader is static — the feeds are read once when the
+> rules pack loads, from whatever is on disk.
 
 ---
 
@@ -493,10 +622,13 @@ email-guard/
 │       ├── propose.py          # writes daily-brief candidates
 │       └── outputs.py
 ├── rules/                       # THE RULES PACK — its own version history
-│   ├── scan/                   # level2.json … declarative pattern rules
-│   ├── assess/                 # level2.py …    procedural assessment logic
+│   ├── scan/                   # level2.json … declarative pattern rules   (fail CLOSED)
+│   ├── assess/                 # level2.py …    procedural assessment logic (fail CLOSED)
+│   ├── reference/              # signature feeds read by triage            (fail OPEN)
+│   │   ├── injection_signatures.json   # level 1 — seeded, high precision
+│   │   └── phishing_signatures.json    # level 2 — deliberately empty
 │   ├── signatures/             # prompt-injection.json  (starts empty)
-│   └── validate.py             # load-time + CI validator
+│   └── validate.py             # load-time + CI validator (scan rules only)
 ├── applier/                     # consumes instructions-{date}.json → writes live lists
 ├── canary/                      # local model service config (e.g. Ollama)
 ├── ui/                          # LAN-only console

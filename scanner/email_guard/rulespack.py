@@ -7,6 +7,13 @@ path via ``importlib``, not by package import.
 
 The pack is validated on load by its own ``rules/validate.py``; an invalid pack
 raises :class:`InvalidRulesPack` and the scanner refuses to run.
+
+That fail-closed rule covers the scan rules and assessors and is not to be
+relaxed. It does **not** cover the signature reference feeds under
+``rules/reference/``, which fail **open** -- a bad feed degrades triage's
+sensitivity instead of halting the scanner. The two failure modes are opposite
+on purpose; :mod:`email_guard.signatures` explains why, and neither should be
+changed to match the other.
 """
 
 from __future__ import annotations
@@ -19,6 +26,8 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+from .signatures import SignatureFeed, load_signature_feed
 
 SCAN_LEVELS = (2, 3, 4)
 
@@ -50,6 +59,7 @@ class RulesPack:
     scan_rules: dict[int, list[dict[str, Any]]]
     assessors: dict[int, ModuleType]
     signatures: dict[str, Any]
+    signature_feed: SignatureFeed = dataclass_field(default_factory=SignatureFeed)
     _func_modules: dict[str, ModuleType] = dataclass_field(default_factory=dict)
 
     @classmethod
@@ -82,11 +92,17 @@ class RulesPack:
             with signatures_path.open(encoding="utf-8") as handle:
                 signatures = json.load(handle)
 
+        # Fails open by contract: a missing or malformed feed yields an empty
+        # one and a logged warning, never an exception. Loaded after the
+        # fail-closed validation above so the ordering makes the split obvious.
+        signature_feed = load_signature_feed(base)
+
         return cls(
             rules_dir=base,
             scan_rules=scan_rules,
             assessors=assessors,
             signatures=signatures,
+            signature_feed=signature_feed,
         )
 
     def rules_for(self, level: int) -> list[dict[str, Any]]:

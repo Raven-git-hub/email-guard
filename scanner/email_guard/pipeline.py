@@ -55,7 +55,9 @@ def scan(
         lists.greylist, sender, sender_domain, message["title"], message["clean_text"]
     )
 
-    initial_level, reasons = triage.initial_level(message, greylist_classification)
+    initial_level, reasons = triage.initial_level(
+        message, greylist_classification, pack.signature_feed
+    )
 
     report = loop.run(message, initial_level, reasons, pack, deepscan)
     final_level = report["finalLevel"]
