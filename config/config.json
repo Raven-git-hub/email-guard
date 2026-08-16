@@ -20,5 +20,11 @@
     "state_file": "data/dispatcher/state.json",
     "quarantine_log": "data/dispatcher/quarantine.log",
     "webhook_url": null
+  },
+
+  "webui": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "frame_ancestors": "'none'"
   }
 }

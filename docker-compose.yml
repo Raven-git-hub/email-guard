@@ -1,0 +1,58 @@
+# Email Guard services.
+#
+# The review console is the first service to land here; the bridge, the
+# dispatcher and the canary join it as each is containerised (root README,
+# "Proposed repository layout").
+#
+# Two lines in this file are the console's whole exposure story, and they are
+# deliberately next to each other:
+#
+#   * `EMAIL_GUARD_WEBUI_HOST: 0.0.0.0` -- the process must bind the container's
+#     interface, or a published port has nothing to reach.
+#   * `ports: 127.0.0.1:8080:8080` -- and the host publishes it to loopback
+#     only. Drop the `127.0.0.1:` prefix and this console is on the LAN:
+#     it reads mail content and edits the lists that decide whether mail is
+#     delivered, over plain HTTP, with no password unless one is configured.
+#
+# Set EMAIL_GUARD_WEBUI_TOKEN in the environment (or a .env file) to require a
+# shared token on every API call. Worth doing on a shared machine, where
+# "loopback" includes every other user on it.
+
+services:
+  webui:
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
+    image: email-guard-webui:0.1.0
+    container_name: email-guard-webui
+    restart: unless-stopped
+
+    # Run as the operator, so the lists this service writes stay editable by
+    # hand on the host. `id -u` / `id -g`, or leave the default.
+    user: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
+
+    environment:
+      EMAIL_GUARD_WEBUI_HOST: "0.0.0.0"
+      EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK: "1"
+      EMAIL_GUARD_WEBUI_PORT: "8080"
+      EMAIL_GUARD_WEBUI_TOKEN: "${EMAIL_GUARD_WEBUI_TOKEN:-}"
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # The same `data/` the dispatcher and the scanner use: the console reads
+      # the candidates they stage and writes the lists they read back.
+      - ./data:/app/data
+      - ./config/config.json:/app/config/config.json:ro
+
+    # Nothing outside the mounted data directory is ever written: the applier
+    # writes its temp files as siblings of the list it is replacing, and
+    # bytecode writing is off.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

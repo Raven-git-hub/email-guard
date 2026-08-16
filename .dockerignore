@@ -1,0 +1,22 @@
+# The build context is a copy of the working tree handed to the daemon, so the
+# personal data in `data/` must not be in it -- the Dockerfile copies explicit
+# paths and would not include it either way, but a build context is a copy all
+# the same (root README, "Storage & privacy").
+data/
+config/secrets.json
+
+.git/
+.gitignore
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Test corpora and reference material are not needed to run any service.
+tests/
+reference/
+README.md

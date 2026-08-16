@@ -62,9 +62,9 @@ The rules pack contains:
 | Dispatcher (bridge IMAP → scanner) | **Built** — poll-based; runs the scanner as a subprocess, IDLE and per-email containers still to come |
 | Canary (local LLM) semantic checks | **To be built** |
 | Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
-| Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; the **applier is built** (`email_guard apply`, decisions document in → live lists out). Review UI still to come |
+| Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; the **applier is built** (`email_guard apply`); the **review console is built** — each Confirm applies one decision immediately |
 | Webhook / output sinks + actions | Partially proven; actions not yet in the greylist schema |
-| Admin UI (lists, stats, quarantine, review, approvals) | **To be built** |
+| Admin UI (lists, stats, quarantine, review, approvals) | **Phase 1 built** (`webui/`) — review queue and list view/add, localhost-bound. Event log, stats, quarantine browsing and config editing are Phase 2 |
 | Unified configuration | **To be built** (replaces conflicting path files + index refs) |
 | Consolidated inbox delivery | **To be built** |
 
@@ -137,8 +137,12 @@ then it exits. Testable offline by piping in a saved `.eml`.
 1–2 messages** for semantic prompt-injection / phishing-language detection. Deliberately
 caged (see below).
 
-**Admin UI** — LAN-only, authenticated console: edits lists, shows stats, browses quarantine
-with forensic logs, and hosts the **daily review** that replaces the old Discord forms.
+**Admin UI** — the review console. **Phase 1 is built** (`webui/`): a localhost-bound FastAPI
+service that hosts the **daily review** replacing the old Discord forms, and shows and edits
+the live lists. It is the only component that imports the scanner as a library — it calls
+`email_guard.apply` to write lists, `email_guard.lists` to read them and `email_guard.config`
+to find them. Stats, quarantine browsing and the event log are Phase 2. See "Running the
+review console".
 
 ---
 
@@ -567,6 +571,91 @@ retry queue is still to come.
 
 ---
 
+## Running the review console
+
+The reviewer's half of the learning loop, served as a single page. The scanner stages
+candidates; this is where a human answers them, and each answer goes straight through
+`email_guard.apply` to the live lists. It writes nothing any other way.
+
+```
+pip install -e ".[webui]"
+python -m email_guard_webui            # http://127.0.0.1:8080/
+```
+
+Flags mirror the scanner's — `--config`, `--lists-dir`, `--daily-brief-dir`,
+`--outbound-dir` — plus `--host` and `--port`. Everything else comes from the `webui`
+section of `config/config.json` or the environment (`EMAIL_GUARD_WEBUI_HOST`,
+`EMAIL_GUARD_WEBUI_PORT`, `EMAIL_GUARD_WEBUI_TOKEN`,
+`EMAIL_GUARD_WEBUI_FRAME_ANCESTORS`).
+
+### What Phase 1 does
+
+- **Review** — the queue read from `data/daily-brief/*/candidate.json`, one card per
+  unreviewed candidate: the sender, the flags, the message excerpt, and which list (if any)
+  already covers that sender. Choose a list, catalogue a structure if it is a greylist
+  decision, and Confirm — which applies **one** decision immediately, as its own
+  single-item decisions document, and moves the candidate into a `reviewed/` sibling so it
+  does not come back on reload. **Skip** is client-side only: it re-queues the card and tells
+  the server nothing, because "not yet" is not a decision.
+- **List Data** — the live entries per list, greylist structures with their resolved
+  dispositions, and a manual **Add** that builds a decision and applies it down the same
+  path. There is no second way into `data/lists/`.
+- **Event Log** and **Config** are present but inert — the event store and the dispatcher
+  config wiring are Phase 2. The Config panel's SAVE is disabled rather than silent, and the
+  recognitions chart is empty rather than invented.
+
+### Why it binds loopback
+
+The console reads mail content and edits the lists that decide whether mail is delivered,
+over plain HTTP, with no password unless you configure one. The default bind is `127.0.0.1`
+and a non-loopback address is refused unless asked for twice — the host *and*
+`--allow-non-loopback` (or `EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK=1`). That flag exists for
+the container case, where the process must bind `0.0.0.0` for a published port to reach it
+and `docker-compose.yml` pins the publication to `127.0.0.1:8080`.
+
+Optional shared-token auth guards every `/api/` route: set `EMAIL_GUARD_WEBUI_TOKEN`, or put
+it in `config/secrets.json` under `webui.token` (git-ignored, like the bridge credentials —
+never in `config.json`, which is committed). Clients present it as `X-Email-Guard-Token`; a
+browser picks it up once from `?token=…`, keeps it in `sessionStorage` and strips it from
+the address bar. The static shell stays reachable without it, because it carries no data and
+a browser cannot put a header on a top-level navigation.
+
+### The rendering rules
+
+Reviewing hostile mail in a browser is the one genuinely dangerous thing this project does,
+so two rules are structural rather than conventional:
+
+- **Every response carries a CSP**, from a middleware so no handler can forget it:
+
+  ```
+  default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
+  connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'none';
+  frame-ancestors 'none'
+  ```
+
+  `frame-ancestors` is the single knob (`webui.frame_ancestors`) so the side-panel host can
+  be allowed to embed the console later without touching the rest of the policy. `script-src
+  'self'` is why the UI's JavaScript lives in `webui/static/app.js` and binds every handler
+  with `addEventListener` — an inline `onclick=` is inline script.
+
+- **The server never sends an HTML body.** The only message text it will serve is the
+  candidate's `excerpt` — the scanner's `clean_text`, HTML already stripped and links already
+  de-fanged — and the client writes it with `textContent`. There is no `innerHTML` in
+  `app.js`, and a test asserts there never is.
+
+### Docker
+
+```
+docker compose up -d webui        # http://127.0.0.1:8080/
+```
+
+The service publishes `127.0.0.1:8080` only and mounts the same `./data` the dispatcher and
+scanner use, so the console reads the candidates they stage and writes the lists they read
+back. Run it as your own uid (`EMAIL_GUARD_UID` / `EMAIL_GUARD_GID`) to keep the lists
+hand-editable afterwards.
+
+---
+
 ## Databases & the daily review
 
 ### List schemas (from the live samples)
@@ -628,6 +717,13 @@ committed** to the repo — which may be published later.
   lists — keeping the repo safe to publish. Fixtures use reserved names only
   (`.example` domains, `example.com`/`.net`/`.org` addresses, TEST-NET IPs) and carry no
   real senders, recipients or correspondents.
+- A reviewed candidate is **moved, not deleted**: the review console puts it in a `reviewed/`
+  sibling under the same `daily-brief-{date}/{job}/` folder, so the proposal behind a list
+  change stays alongside it. That tree is already git-ignored personal data, so keeping it
+  costs nothing and losing it would cost the audit trail.
+- The review console serves mail content to a browser on loopback and adds no new store: it
+  reads the same `data/daily-brief/` and writes the same `data/lists/`. Nothing it renders is
+  cached (`Cache-Control: no-store` on every API response).
 
 ### Greylist match outcomes
 
@@ -643,7 +739,7 @@ entry must not override that. Neither the scan over structures nor the scan over
 entries short-circuits, because a sender at `notify.bank.example` can be covered by a
 `bank.example` entry and a `notify.bank.example` entry at once.
 
-### The learning loop (currently over Discord, moving into the UI)
+### The learning loop (now in the review console — see "Running the review console")
 
 1. **Propose** — the scanner generates candidate entries for unfamiliar senders / new
    structures into `daily-brief-{date}/`.
@@ -651,9 +747,11 @@ entries short-circuits, because a sender at `notify.bank.example` can be covered
 3. **Review** — once a day the UI shows the batch; each card presents the proposal (the
    Canary can pre-annotate a suggested classification + reason) and lets you choose the
    list, whether to catalogue a new structure, and the action group.
-4. **Apply** — decisions compile into a **decisions document**, `decisions-{date}.json`,
-   handed to the applier that writes the live lists. Nothing edits the lists without
-   approval.
+4. **Apply** — decisions compile into a **decisions document** handed to the applier that
+   writes the live lists. Nothing edits the lists without approval. Two producers, one
+   contract: the CLI takes a whole `decisions-{date}.json` by hand, and the review console
+   emits a single-decision document per Confirm — the applier is all-or-nothing, so batching
+   a day's answers would let one bad card block every other decision.
 
 #### The decisions document
 
@@ -741,7 +839,7 @@ the UI.
 email-guard/
 ├── README.md
 ├── .gitignore                   # ignores data/lists/*.json (keeps *.sample.json)
-├── docker-compose.yml          # bridge + dispatcher + canary + ui + volumes
+├── docker-compose.yml          # webui today; bridge + dispatcher + canary + volumes to follow
 ├── dispatcher/
 │   └── email_guard_dispatcher/ # Python package: bridge IMAP in, scanner subprocesses out
 │       ├── __main__.py         # --once / poll loop
@@ -773,7 +871,16 @@ email-guard/
 │   ├── signatures/             # prompt-injection.json  (starts empty)
 │   └── validate.py             # load-time + CI validator (scan rules only)
 ├── canary/                      # local model service config (e.g. Ollama)
-├── ui/                          # LAN-only console
+├── webui/                       # the review console — localhost-bound FastAPI + one page
+│   ├── Dockerfile
+│   ├── email_guard_webui/      # Python package: the only consumer of the scanner library
+│   │   ├── __main__.py         # argparse + uvicorn; refuses a non-loopback bind
+│   │   ├── config.py           # host/port/token/frame-ancestors + the scanner's data dirs
+│   │   ├── app.py              # the FastAPI app: CSP middleware, token guard, endpoints
+│   │   ├── candidates.py       # the daily-brief queue: read, project, consume
+│   │   ├── decisions.py        # a card's answer → a one-item decisions document
+│   │   └── listing.py          # the live lists, projected for the List Data panel
+│   └── static/                 # index.html + app.css + app.js (no inline script — CSP)
 ├── config/
 │   ├── config.json             # single unified config (replaces path files + index refs)
 │   └── secrets.sample.json     # template for config/secrets.json (git-ignored)
@@ -826,8 +933,10 @@ email-guard/
 9. Formalise output sinks and the **action** payload; add `action` to the greylist schema.
 10. ~~Build the applier half of the learning loop~~ **Done** — `email_guard apply` consumes a
     decisions document and writes the live lists, with greylist dispositions and tags behind
-    it. Still to do: the review UI that emits the decisions document, and the daily digest
-    that presents the batch.
+    it. ~~The review UI that emits the decisions document~~ **Done (Phase 1)** — `webui/`
+    serves the review queue and the list panel over loopback. Still to do: the event store
+    behind the Event Log and the recognitions chart, the dispatcher config panel, and the
+    daily digest that presents the batch.
 11. Wire up consolidated-inbox delivery for `cleared` mail.
 12. Seed the prompt-injection signature DB (Canary-assisted) as real traffic is seen.
 13. Fix the known issues; add a regression corpus of real sample messages.
