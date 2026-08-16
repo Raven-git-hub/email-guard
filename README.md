@@ -332,9 +332,34 @@ Resolution order, highest first:
 2. *TODO(cache):* a last-known-good copy of the last feed that loaded cleanly, so a bad update
    degrades to yesterday's signatures rather than all the way to the baseline. Not implemented
    — there is nowhere to cache to until the interval pull exists.
-3. nothing — triage falls back to the hard-baked markers in `scanner/email_guard/triage.py`
-   (`_ROLEPLAY_RE`, `_HIDDEN_UNICODE_RE`, `_FENCE_RE`). These are a permanent floor, not a
-   default the feed replaces: the feed only ever adds to them.
+3. nothing — triage falls back to the hard-baked floor in `scanner/email_guard/triage.py`.
+   This is a permanent baseline, not a default the feed replaces: the feed only ever adds
+   to it.
+
+### The hard-baked floor
+
+| Marker | Catches |
+|--------|---------|
+| `roleplay_tag` | instruction framing — `system:`, `### Instruction:`, `[INST]:` |
+| `hidden_unicode` | zero-width and BOM characters smuggling text past a human reader |
+| `code_fences` | two or more ` ``` ` fences |
+| `instruction_override` | the canonical prose override — `ignore`/`disregard` + `(all)? (the)? previous/prior/earlier/above/foregoing` + `instructions/prompts/directions/rules/commands` |
+
+The first three are *structural*. `instruction_override` is prose, and it is here because the
+most common phrasing of the attack once lived only in the feed — so losing the feed reopened
+exactly the hole rule 2 exists to close: a whitelisted sender carrying "ignore all previous
+instructions" fell through to level 5, cleared. **A rule that evaporates when a file goes
+missing is not a floor.**
+
+**Floor and feed overlap on purpose**: the floor is the permanent subset that cannot go
+missing, the feed is the updatable superset carrying the long tail (persona reassignment,
+concealment, `new system instructions:`). The floor stays deliberately small — anything that
+*must* survive the fail-open state belongs in it, everything else belongs in the feed.
+
+Both halves are held to the same precision bar, against one shared false-positive corpus in
+`tests/conftest.py`. `instruction_override` requires the instruction-shaped object for the
+same reason the feed seeds do: "please disregard the previous **email**" is a routine
+correction notice, "disregard the previous **instructions**" is not.
 
 > **TODO(feed-pull):** pulling this repository on an interval so signature updates land without
 > a redeploy is the intended operating mode, and is what the fail-open behaviour above exists

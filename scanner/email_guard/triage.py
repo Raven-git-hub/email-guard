@@ -64,6 +64,11 @@ from .signatures import SignatureFeed
 # what triage still catches when the signature feed is missing, empty or
 # unreadable -- see email_guard.signatures on why that feed fails open. The
 # feed adds to these markers; it never removes them.
+#
+# So the floor has to be able to stand alone. Anything that MUST be caught in
+# the fail-open state belongs here, not only in the feed -- rule 2 is what
+# stops a whitelisted sender being trusted with a payload, and a rule that
+# evaporates when a file goes missing is not a floor.
 # ---------------------------------------------------------------------------
 
 # Roleplay / instruction framing, e.g. "system:", "### Instruction:", "[INST]:".
@@ -72,6 +77,31 @@ _ROLEPLAY_RE = re.compile(r"(system|user|assistant|instruction|###|\[INST\])\s*:
 # Escape form deliberately -- these are invisible when pasted literally.
 _HIDDEN_UNICODE_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 _FENCE_RE = re.compile(r"```")
+# The canonical prose override, mirroring feed seeds inj-0001 and inj-0002.
+#
+# The three markers above are all *structural* -- framing tokens, invisible
+# characters, fenced blocks. Without this one the single most common phrasing
+# of the attack ("ignore all previous instructions") lived only in the feed,
+# so losing the feed reopened exactly the hole rule 2 exists to close: a
+# whitelisted sender carrying that sentence fell through to level 5, cleared.
+#
+# One alternation rather than two near-identical patterns: "ignore" and
+# "disregard" are the same shape with the same object, and the floor is meant
+# to stay a small permanent failsafe. The feed keeps the long tail (persona
+# reassignment, concealment, "new system instructions:"), and the overlap
+# between floor and feed is intended -- floor is a subset that cannot go
+# missing, feed is the updatable superset.
+#
+# Held to the same precision bar as the feed: the instruction-shaped OBJECT is
+# required, because a level-1 hit rejects even a whitelisted sender. "Please
+# disregard the previous email" is a routine correction notice; "disregard the
+# previous instructions" is not.
+_OVERRIDE_RE = re.compile(
+    r"(?:ignore|disregard)\s+(?:all\s+)?(?:the\s+)?"
+    r"(?:previous|prior|earlier|above|foregoing)\s+"
+    r"(?:instructions|prompts|directions|rules|commands)",
+    re.IGNORECASE,
+)
 
 
 def content_text(message: dict[str, Any]) -> str:
@@ -90,6 +120,8 @@ def injection_markers(clean_text: str) -> list[str]:
         found.append("hidden_unicode")
     if len(_FENCE_RE.findall(text)) >= 2:
         found.append("code_fences")
+    if _OVERRIDE_RE.search(text):
+        found.append("instruction_override")
     return found
 
 
