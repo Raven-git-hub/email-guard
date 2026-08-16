@@ -59,7 +59,8 @@ The rules pack contains:
 | Source cleaners (Outlook / Gmail / Proton) | Provided; contracts to be standardised |
 | Triage / initial level assignment | Exists; greylist matching to be updated to current schema |
 | Signature reference DB (`rules/reference/`) | **Scaffolded** — injection feed seeded, phishing feed empty by design; static loader that fails open. Interval-pulling from git not built |
-| Dispatcher (bridge IMAP → scanner) | **Built** — poll-based; runs the scanner as a subprocess, IDLE and per-email containers still to come |
+| Dispatcher (bridge IMAP → scanner) | **Built** — on-arrival via IMAP `IDLE`, with the poll loop kept as the correctness backstop. Two scanner runners behind one interface: subprocess (dev) and one hardened container per message (deployed) |
+| Per-message scanner container | **Built, unvalidated on a host** — `scanner/Dockerfile` plus `ContainerRunner`: `docker run --rm`, no network, read-only root, non-root, caps dropped, memory/pid/cpu bounded, Docker reached via a socket-proxy. Built where no Docker daemon exists, so the container path has never actually run — see `VALIDATION.md` |
 | Canary (local LLM) semantic checks | **To be built** |
 | Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
 | Candidate generation + daily review | Scanner **stages candidates** to `daily-brief-{date}/`; the **applier is built** (`email_guard apply`); the **review console is built** — each Confirm applies one decision immediately |
@@ -128,6 +129,18 @@ ephemeral **Scanner** (`docker run --rm`) per message with the rules pack mounte
 concurrency and **owns webhook delivery + retries** so an offline downstream never loses an
 event. Deliberately dumb, so it can later be swapped for a worker pool without touching the
 scanner.
+
+IDLE is a **trigger only**. Every wake runs the same full drain — enumerate all
+unprocessed UIDs — and a drain also happens every `poll_interval_seconds` regardless of
+what the server announces. So a missed push or a silently-dropped IDLE connection costs
+latency and cannot strand a message: the durable queue is still the mailbox, and the
+done-list is still the state file.
+
+How the scanner is invoked is chosen by config (`dispatcher.scanner_runner`) behind a
+one-method interface — `scan(raw) -> verdict`. `subprocess` needs no daemon and is the
+code default for development and tests; `container` is what compose deploys. The dispatch
+logic is identical either way, which is the point: the isolation strategy can change
+without the loop changing with it.
 
 **Scanner** — the core engine, a **pure function in container form**: one raw RFC822 message
 + a rules pack in, a verdict + routing decision + database candidates + output event out,
@@ -479,7 +492,9 @@ The non-secret settings live in the `imap` section of `config/config.json`:
   "poll_interval_seconds": 30,
   "max_attempts": 3,
   "concurrency": 4,
-  "scan_timeout_seconds": 120
+  "scan_timeout_seconds": 120,
+  "idle": true,
+  "idle_timeout_seconds": 1500
 }
 ```
 
@@ -489,9 +504,27 @@ The non-secret settings live in the `imap` section of `config/config.json`:
 | `mailbox` | Which mailbox to watch. |
 | `tls` | `starttls` (the bridge's default), `ssl`, or `none`. |
 | `ca_file` | A CA bundle to verify the bridge certificate against. Usually unnecessary — see below. |
-| `poll_interval_seconds` | How often to check for new mail. |
+| `poll_interval_seconds` | The **guaranteed** drain interval. With IDLE on, mail normally arrives long before this; it is what makes a missed notification harmless rather than a lost message. |
 | `max_attempts` | Scans per message before it is quarantined. |
-| `concurrency` | Simultaneous scanner subprocesses. |
+| `concurrency` | Simultaneous scans. Under the container runner this is also how many hardened containers can be alive at once — see "Aggregate resource footprint". |
+| `idle` | Use IMAP `IDLE` for on-arrival processing. Set `false` (or `EMAIL_GUARD_IMAP_IDLE=0`) to fall back to pure polling. |
+| `idle_timeout_seconds` | How long one `IDLE` stretch may last before being re-issued. Default 1500s, comfortably inside the ~29 minutes RFC 2177 warns a server may allow. |
+
+**About IDLE.** It is hand-rolled over the standard-library `imaplib` connection
+(`dispatcher/email_guard_dispatcher/idle.py`) rather than pulled from a library, to keep the
+dispatcher's zero-runtime-dependency property. That is only defensible because IDLE here is
+a *latency* optimisation and never a correctness one — the poll interval above still bounds
+the drain, so a best-effort IDLE that occasionally gives up is exactly good enough. If a
+future change makes latency load-bearing, `imapclient` is the obvious swap and `idle.py` is
+the only file that would go. Reaching into `imaplib` internals is confined to that one file
+for the same reason.
+
+The connection self-demotes when it has to: a server that does not advertise `IDLE`, or
+answers `BAD`, drops to polling with one log line; repeated failures give up on IDLE until
+the next reconnect. Nothing in that path can lose mail.
+
+**Selecting the scanner runner** — `dispatcher.scanner_runner`, `"subprocess"` (default) or
+`"container"`, overridable with `EMAIL_GUARD_SCANNER_RUNNER`. See "Container runtime".
 
 **About the certificate.** The bridge generates its own self-signed certificate at install
 time, so there is nothing to verify it against. On a **loopback** host (`127.0.0.1`, `::1`,
@@ -528,16 +561,19 @@ python -m email_guard_dispatcher --once --verbose
 
 `--once` scans the currently-UNSEEN messages and exits — the right shape for a first live
 test and for cron. `--verbose` prints one line per message: uid, sender, final level, bucket.
-Drop `--once` to run the poll loop until stopped:
+Drop `--once` to run until stopped — mail is then processed **on arrival**, with the poll
+interval as the backstop rather than the schedule:
 
 ```sh
-python -m email_guard_dispatcher            # polls every poll_interval_seconds
+python -m email_guard_dispatcher            # IDLE, and a full drain at least every
+                                            # poll_interval_seconds regardless
 ```
 
 > **The first live run processes your entire unread backlog.** The dispatcher finds work with
 > `SEARCH UNSEEN`, so every unread message in the mailbox is scanned on that first pass. Point
 > the first `--once` run at a small or test intake mailbox (`--mailbox Intake`) before turning
-> it loose on a real inbox.
+> it loose on a real inbox. Under the container runner that first pass is also **slow** — one
+> container created and destroyed per message — which is expected, not a fault.
 >
 > The converse also matters: **a message already marked `\Seen` by another client is never
 > scanned.** That is fine for the intended setup — a dedicated intake mailbox that no human
@@ -548,9 +584,12 @@ python -m email_guard_dispatcher            # polls every poll_interval_seconds
 
 1. `FETCH` the raw RFC822 bytes by UID (with `BODY.PEEK[]`, so reading does not mark the
    message seen before it has actually been scanned).
-2. Write them to a temp `.eml`, run `python -m email_guard <tmpfile>`, capture the verdict
-   JSON from stdout and the exit code, delete the temp file. The scanner files the message
-   into `outbound/<bucket>/<job>/` itself.
+2. Stage them as an `.eml` and hand them to the configured **scanner runner**, which returns
+   the verdict JSON from stdout and an exit code, then cleans up after itself. Under
+   `subprocess` that is `python -m email_guard <tmpfile>` on this host; under `container` it
+   is `docker run --rm` of the hardened scanner image, and the dispatcher moves that scan's
+   private output into `outbound/<bucket>/<job>/` afterwards. Everything downstream of this
+   step is identical either way.
 3. On success: record the message as processed, mark it `\Seen`, and hand the verdict to the
    configured sinks.
 4. On failure: retry up to `max_attempts`. After that, write a line to the quarantine log and
@@ -568,6 +607,158 @@ Set `dispatcher.webhook_url` in `config/config.json` or `EMAIL_GUARD_WEBHOOK_URL
 environment and each verdict is POSTed as JSON, with a short retry and backoff. With no URL
 set, the default sink just logs the verdict. Delivery is currently best-effort — a durable
 retry queue is still to come.
+
+---
+
+## Container runtime
+
+> **Not yet validated on a real host.** This was built in an environment with a Docker
+> client but no daemon, so no container described here has ever actually started. Everything
+> reachable without a daemon is tested — the command construction, the hardening flags, the
+> host-path translation, orphan reaping, output collection. Starting a container is not.
+> **`VALIDATION.md` is the first bring-up runbook**, and it is a real step.
+
+The scanner is the component that parses attacker-controlled input, and the roadmap has it
+growing attachment inspection. A subprocess shares this host's filesystem, network and
+kernel; that is not a sandbox. In production each message gets its own container, which is
+then destroyed.
+
+### One `docker run` per message
+
+```
+docker run --rm --name email-guard-scan-<token>
+  --label email-guard.role=scanner --label email-guard.scan=<token>
+  --network none --read-only --user <uid>:<gid>
+  --cap-drop ALL --security-opt no-new-privileges
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
+  --memory 512m --memory-swap 512m --pids-limit 128 --cpus 1.0
+  --pull never
+  -v <host>/…/<token>/message.eml:/message/message.eml:ro
+  -v <host>/rules:/rules:ro
+  -v <host>/data/lists:/data/lists:ro
+  -v <host>/…/<token>/outbound:/data/outbound
+  -v <host>/…/<token>/daily-brief:/data/daily-brief
+  email-guard-scanner:0.1.0 /message/message.eml
+```
+
+| Flag | What it bounds |
+|------|----------------|
+| `--rm` | One message, one lifetime. Nothing accumulates. |
+| `--network none` | No loopback, no DNS, no egress. A message that achieves execution has nowhere to call. |
+| `--read-only` | Immutable root filesystem; the only writable paths are the tmpfs and this scan's own output. |
+| `--user <uid>:<gid>` | Never root, even inside a throwaway. Inherited from the dispatcher's own uid; a root dispatcher is refused at startup. |
+| `--cap-drop ALL` | The scanner needs no capabilities. |
+| `--security-opt no-new-privileges` | A setuid binary cannot re-escalate what was dropped. |
+| `--tmpfs /tmp` | `noexec,nosuid,nodev` and size-capped — scratch space, not a staging area. |
+| `--memory` + `--memory-swap` | Equal on purpose: without the swap cap a memory limit is evaded by swapping. An archive bomb is OOM-killed. |
+| `--pids-limit` | A fork bomb exhausts its own quota and nothing else. |
+| `--cpus` | A catastrophic-backtracking regex cannot starve the host. |
+
+All of it dies with the container. What the dispatcher sees is an ordinary failed scan, so
+an OOM kill takes the same retry-then-quarantine path as a bad rules pack.
+
+### What a scan container can see
+
+Its own message, the rules pack and the lists — all read-only — plus an **empty, per-scan**
+output directory it may write. It does **not** get the shared `data/outbound`: that is the
+archive of every message previously judged hostile, and handing a fresh copy to each new
+suspect message would be a strange thing for a quarantine to do. The dispatcher moves the
+results into place after the container is gone, as a blind directory merge — it knows the
+scanner's *paths* because it has to mount them, and nothing about its *format*.
+
+One consequence worth knowing: the scanner reports paths as it saw them, so the verdict's
+`written` section is rewritten to point at where the files actually ended up before any sink
+sees it.
+
+### Docker access: a socket-proxy, never the socket
+
+The dispatcher must create containers. The obvious way — bind-mounting
+`/var/run/docker.sock` into it — is host-root-equivalent: anyone reaching that socket can
+start a privileged container mounting `/`. Giving it to the process that handles hostile
+mail would defeat the entire exercise, so the socket goes to a `tecnativa/docker-socket-proxy`
+instead, on an `internal: true` network, with an allow-list.
+
+**Be clear-eyed about what that buys.** `CONTAINERS=1` + `POST=1` still permits container
+creation, which is inherently powerful. What it removes is everything else — images,
+volumes, networks, exec, swarm, system and info — and it keeps the socket out of the
+dispatcher's mount namespace entirely. A large reduction, not an elimination. Claiming
+otherwise would be false comfort.
+
+The allow-list starts as tight as it plausibly goes. **If the first real `docker run`
+returns a 403 from the proxy, the fix is the allow-list, not the code** — most likely
+`IMAGES: 1`, since `docker run` may inspect the local image before creating a container.
+Add only what a refused call actually names; `VALIDATION.md` has the diagnosis steps.
+
+### The volume-path model, and the way it fails
+
+Bind-mount **sources are resolved by the host daemon**, not inside the dispatcher's mount
+namespace. A containerised dispatcher that passes its own internal path mounts a different
+directory — or an empty new one — and *the failure is quiet*: the container starts, finds no
+rules pack, and reports a rules-pack error that says nothing about mounts.
+
+So configuration carries **both** paths for every shared tree, and the runner translates:
+
+| Key | Meaning |
+|-----|---------|
+| `container.host_data_dir` / `container.data_dir` | where `data/` is **on the host**, and where the dispatcher sees it |
+| `container.host_rules_dir` / `container.rules_dir` | the same pair for the rules pack |
+
+Host paths default to the dispatcher's own, which is correct whenever it is not itself
+containerised. Under compose they come from a single `EMAIL_GUARD_HOST_ROOT` in `.env`, and
+compose refuses to start if it is unset. The per-message spool is deliberately created
+*under* the data root so it is translatable; anything outside is a startup error.
+
+Startup checks everything checkable without a daemon and logs the full mapping at INFO.
+Whether the host path is *correct* is only observable on a host — check that log line by eye
+on first bring-up.
+
+### Orphan reaping
+
+`--rm` only fires when a container exits on its own, so a dispatcher killed mid-scan leaves
+one running, still holding its memory and pid quota. Every scan container is labelled
+`email-guard.role=scanner`; on startup, **before draining**, the dispatcher removes any it
+finds. The label is what makes them identifiable without a registry that would itself have
+to survive the crash. Reaping failures log and continue — draining mail matters more.
+
+Labels carry a random token, never a sender or a message id: `docker ps` output is not a
+place for personal data.
+
+### Aggregate resource footprint
+
+The caps above are **per container**, and scans run in the existing thread pool, so up to
+`concurrency` of them are live at once. Set the two as a matched pair:
+
+| `concurrency` | Peak memory | Peak pids | Peak CPU |
+|---|---|---|---|
+| 4 (default) | **2 GB** | 512 | 4 cores |
+| 2 | 1 GB | 256 | 2 cores |
+| 1 | 512 MB | 128 | 1 core |
+
+Lower `imap.concurrency`, or lower `dispatcher.container.memory`, if that ceiling does not
+fit the host. Both are configurable; the defaults assume a machine with a few GB to spare.
+
+**Expect the first drain of a large backlog to be slow.** One container is created, run and
+destroyed per message, and container startup dominates a scan that otherwise takes
+milliseconds — so it is materially slower than the subprocess path. That is correct
+behaviour, not a fault. Point the first live run at a small intake mailbox.
+
+### Updating the scanner
+
+The scanner now runs from an **image**, not from the working tree. Changing scanner code and
+restarting the dispatcher does nothing — the dispatcher is not what runs it:
+
+```sh
+docker compose --profile build build scanner   # rebuild the image
+docker compose restart dispatcher              # only needed for dispatcher changes
+```
+
+The next message picks up the new image automatically; there is nothing to restart for the
+scanner itself, because every scan is a fresh container. `EMAIL_GUARD_SCANNER_IMAGE` and the
+tag compose builds must agree — if they drift, every scan fails with `No such image`, which
+the runner reports as exactly that and names the rebuild as the fix.
+
+Changing the **rules pack or the lists** needs no rebuild at all: both are mounted read-only
+at scan time, so an edit takes effect on the next message.
 
 ---
 
@@ -645,14 +836,40 @@ so two rules are structural rather than conventional:
 
 ### Docker
 
+The console is one service in the full stack:
+
 ```
-docker compose up -d webui        # http://127.0.0.1:8080/
+cp .env.sample .env && $EDITOR .env       # required paths and credentials
+docker compose --profile build build scanner
+docker compose build dispatcher webui
+docker compose up -d                       # bridge + dispatcher + socket-proxy + webui
 ```
 
-The service publishes `127.0.0.1:8080` only and mounts the same `./data` the dispatcher and
-scanner use, so the console reads the candidates they stage and writes the lists they read
-back. Run it as your own uid (`EMAIL_GUARD_UID` / `EMAIL_GUARD_GID`) to keep the lists
+`docker compose up -d webui` still brings up the console alone.
+
+The console publishes `127.0.0.1:8080` only and shares the same data volume the dispatcher
+and scanner use, so it reads the candidates they stage and writes the lists they read back.
+Run it as your own uid (`EMAIL_GUARD_UID` / `EMAIL_GUARD_GID`) to keep the lists
 hand-editable afterwards.
+
+**The state file and the data directories live on a named volume**, so a container recreate
+cannot take the done-list with it — losing `data/dispatcher/state.json` would rescan the
+whole mailbox and re-fire every webhook. The volume is bound to a known host directory
+because the dispatcher has to name that host path when mounting into scanner containers.
+
+Two things to know before the first `up`:
+
+- **`EMAIL_GUARD_HOST_ROOT` must be this repo's absolute path on the host.** Compose fails
+  loudly if it is unset; if it is set but *wrong*, scans fail with a confusing rules-pack
+  error. See "The volume-path model" above.
+- **The bridge service reuses your existing, already-logged-in Proton Bridge** via
+  `EMAIL_GUARD_BRIDGE_CONFIG_DIR`. It does not initialise a new one, and pointing it at an
+  empty directory forces the whole account-login and keychain dance again.
+
+Scanner containers are created by the dispatcher, not by compose, so they never appear in
+`docker compose ps`. Find them with `docker ps --filter label=email-guard.role=scanner`.
+
+Full first-run procedure and diagnosis: **`VALIDATION.md`**.
 
 ---
 
@@ -838,19 +1055,26 @@ the UI.
 ```
 email-guard/
 ├── README.md
+├── VALIDATION.md                # first bring-up runbook for the container runtime
 ├── .gitignore                   # ignores data/lists/*.json (keeps *.sample.json)
-├── docker-compose.yml          # webui today; bridge + dispatcher + canary + volumes to follow
+├── .env.sample                  # host paths + bridge credentials for compose
+├── docker-compose.yml          # bridge + dispatcher + socket-proxy + webui (+ canary to follow)
 ├── dispatcher/
-│   └── email_guard_dispatcher/ # Python package: bridge IMAP in, scanner subprocesses out
-│       ├── __main__.py         # --once / poll loop
+│   ├── Dockerfile              # long-lived service; carries the docker CLI, never the socket
+│   └── email_guard_dispatcher/ # Python package: bridge IMAP in, scanner containers out
+│       ├── __main__.py         # --once / IDLE+poll loop; reaps orphans before draining
 │       ├── config.py           # imap section + secrets (env or git-ignored file)
 │       ├── mailsource.py       # MailSource protocol, ImapMailSource, FakeMailSource
-│       ├── scanner_client.py   # runs `python -m email_guard`, reads the verdict
+│       ├── idle.py             # hand-rolled IMAP IDLE over imaplib (the only file that
+│       │                       #   touches imaplib internals)
+│       ├── scanner_runner.py   # the seam: ScanOutcome, ScannerRunner, runner selection
+│       ├── scanner_client.py   # SubprocessRunner -- `python -m email_guard`
+│       ├── container_runner.py # ContainerRunner -- `docker run --rm`, one per message
 │       ├── state.py            # processed (UIDVALIDITY, UID) + quarantine log
 │       ├── sinks.py            # verdict output: logging, optional webhook
 │       └── runner.py           # fetch -> scan (pooled) -> commit (serial)
 ├── scanner/
-│   ├── Dockerfile
+│   ├── Dockerfile              # the per-message unit: pure function in container form
 │   └── email_guard/            # Python package: .eml + rules pack in → verdict out
 │       ├── __main__.py
 │       ├── clean/              # outlook.py, gmail.py, proton.py  (one shared contract)
@@ -927,9 +1151,12 @@ email-guard/
 4. Reconcile the greylist matching to the `known_structures` schema (incl. match-all).
 5. Unify configuration into one named config; drop index-based path references.
 6. Add the Canary client and stand up the local LLM service; gate on level 1–2.
-7. Containerise the scanner (`--rm`); test offline against saved messages.
-8. ~~Build the dispatcher (IMAP → spawn) with concurrency + webhook delivery.~~ **Done**,
-   poll-based. Still to do: IMAP `IDLE` for latency, and a durable webhook retry queue.
+7. ~~Containerise the scanner (`--rm`); test offline against saved messages.~~ **Done** —
+   `scanner/Dockerfile` and `ContainerRunner` run one hardened throwaway container per
+   message. Still to do: validate it on a host with a real Docker daemon (`VALIDATION.md`).
+8. ~~Build the dispatcher (IMAP → spawn) with concurrency + webhook delivery.~~ **Done**.
+   ~~Still to do: IMAP `IDLE` for latency~~ **Done** — IDLE triggers the drain, polling
+   still guarantees it. Still to do: a durable webhook retry queue.
 9. Formalise output sinks and the **action** payload; add `action` to the greylist schema.
 10. ~~Build the applier half of the learning loop~~ **Done** — `email_guard apply` consumes a
     decisions document and writes the live lists, with greylist dispositions and tags behind

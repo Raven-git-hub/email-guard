@@ -9,13 +9,15 @@ within a UIDVALIDITY generation. If the server ever renumbers a mailbox, UID 7
 afterwards is a different message from UID 7 before, so the processed-state key
 has to carry both (RFC 3501 s2.3.1.1).
 
-.. note::
-   Poll-based for now: :class:`ImapMailSource` is asked for UNSEEN messages
-   every ``poll_interval_seconds``. IMAP IDLE would cut latency from that
-   interval to near-instant and is the intended later enhancement -- it needs
-   connection keepalive, a re-IDLE timer (servers drop an idle connection after
-   ~29 minutes) and a wakeup path, none of which is worth building before the
-   poll loop has proven itself. Not built now.
+``wait_for_activity`` is the on-arrival half. It is **optional** in the
+protocol: the runner duck-types it and falls back to sleeping, so a source that
+cannot push (the fake, or a server without IDLE) still works exactly as before.
+It is a *trigger only* -- it reports "something happened", never *what*, so the
+caller has nothing to act on but a full re-enumeration. That is deliberate. A
+targeted fetch of the announced message would make the notification
+load-bearing, and a dropped notification would then strand mail; as it is, the
+durable queue is the mailbox and the done-list is the state file, exactly as
+before.
 """
 
 from __future__ import annotations
@@ -23,13 +25,24 @@ from __future__ import annotations
 import imaplib
 import logging
 import re
+import threading
+import time
 from typing import Protocol
 
+from . import idle
 from .config import TLS_NONE, TLS_SSL, TLS_STARTTLS, ImapSettings
 
 log = logging.getLogger(__name__)
 
 _UIDVALIDITY_RE = re.compile(rb"UIDVALIDITY\s+(\d+)", re.IGNORECASE)
+
+# Consecutive IDLE failures tolerated before a connection is demoted to pure
+# polling. Small, because the alternative is re-failing every cycle; a
+# reconnect clears it, so the demotion is never permanent.
+IDLE_FAILURES_BEFORE_POLLING = 3
+
+# How often FakeMailSource re-checks its stop flag while pretending to idle.
+_FAKE_SLICE_SECONDS = 0.01
 
 
 class MailSourceError(RuntimeError):
@@ -50,6 +63,21 @@ class MailSource(Protocol):
         """Mark one message handled, so it is not served again."""
 
 
+class SupportsIdle(Protocol):
+    """The optional on-arrival half of :class:`MailSource`.
+
+    Duck-typed by the runner rather than required, so nothing that cannot push
+    has to pretend it can.
+    """
+
+    def wait_for_activity(self, timeout: float, stop: object = None) -> bool:
+        """Block up to ``timeout``. ``True`` if the mailbox may have changed.
+
+        Never raises: a source that cannot wait usefully returns ``False``
+        having slept, so the caller drains on the ordinary poll schedule.
+        """
+
+
 class ImapMailSource:
     """The real one: an IMAP connection to the Proton Mail Bridge.
 
@@ -65,6 +93,9 @@ class ImapMailSource:
         self._timeout = timeout
         self._conn: imaplib.IMAP4 | None = None
         self._uid_validity: str = ""
+        # Reset by connect(), so a reconnect always gives IDLE another chance.
+        self._idle_enabled = bool(settings.idle)
+        self._idle_failures = 0
 
     # -- connection lifecycle -------------------------------------------------
 
@@ -95,10 +126,25 @@ class ImapMailSource:
                 log.warning("IMAP running without TLS (tls=none) to %s", settings.host)
 
         conn.login(username, password)
+        # imaplib refreshes capabilities after STARTTLS but not after LOGIN, and
+        # servers routinely advertise more once authenticated -- IDLE among
+        # them. Without this the capability check below reads the pre-auth
+        # banner and can wrongly conclude the server cannot IDLE.
+        self._refresh_capabilities(conn)
         self._check(*conn.select(_quote(settings.mailbox)), what="SELECT")
         self._conn = conn
         self._uid_validity = self._read_uid_validity(conn)
-        log.info("selected %s (uidvalidity=%s)", settings.mailbox, self._uid_validity)
+        self._idle_failures = 0
+        self._idle_enabled = bool(settings.idle)
+        if self._idle_enabled and not idle.server_supports_idle(conn):
+            log.info("server does not advertise IDLE; polling every %ss", settings.poll_interval_seconds)
+            self._idle_enabled = False
+        log.info(
+            "selected %s (uidvalidity=%s, idle=%s)",
+            settings.mailbox,
+            self._uid_validity,
+            "on" if self._idle_enabled else "off",
+        )
 
     def close(self) -> None:
         """Best-effort teardown; a failure here never matters to the caller."""
@@ -146,7 +192,59 @@ class ImapMailSource:
         typ, data = conn.uid("STORE", uid, "+FLAGS", r"(\Seen)")
         self._check(typ, data, what=f"STORE \\Seen uid={uid}")
 
+    # -- on-arrival -----------------------------------------------------------
+
+    def wait_for_activity(self, timeout: float, stop=None) -> bool:
+        """Hold IDLE for up to ``timeout``. ``True`` if the mailbox changed.
+
+        Never raises. Every failure mode degrades to sleeping out the remaining
+        time and returning ``False``, because the caller's next move either way
+        is a full drain -- and a drain against a broken connection is what
+        trips the runner's existing reconnect/backoff path. IDLE going wrong
+        must cost latency, never a message.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self._idle_enabled:
+            if stop is not None and stop.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                conn = self._require_conn()
+                # Each stretch is re-issued well inside the ~29 minute window
+                # RFC 2177 warns servers may enforce on an idle connection.
+                stretch = min(remaining, self._settings.idle_timeout_seconds)
+                if idle.idle_once(conn, stretch, stop):
+                    return True
+                self._idle_failures = 0
+            except idle.IdleUnsupported as exc:
+                log.info("server refused IDLE (%s); polling from here on", exc)
+                self._idle_enabled = False
+            except Exception as exc:  # noqa: BLE001 - never fail the loop
+                self._idle_failures += 1
+                log.warning(
+                    "IDLE failed (%s/%s): %s; draining on the poll schedule meanwhile",
+                    self._idle_failures,
+                    IDLE_FAILURES_BEFORE_POLLING,
+                    exc,
+                )
+                if self._idle_failures >= IDLE_FAILURES_BEFORE_POLLING:
+                    # Stop retrying on this connection. A reconnect -- which the
+                    # runner performs when a drain fails -- re-enables it.
+                    log.warning("giving up on IDLE for this connection; reconnect re-enables it")
+                    self._idle_enabled = False
+                break
+
+        return _sleep_out(deadline - time.monotonic(), stop)
+
     # -- internals ------------------------------------------------------------
+
+    def _refresh_capabilities(self, conn: imaplib.IMAP4) -> None:
+        try:
+            conn._get_capabilities()
+        except Exception as exc:  # noqa: BLE001 - advisory; IDLE self-demotes anyway
+            log.debug("could not refresh capabilities after login: %s", exc)
 
     def _fetch_one(self, conn: imaplib.IMAP4, uid: str) -> bytes | None:
         # BODY.PEEK[] rather than BODY[]: plain BODY[] sets \Seen as a side
@@ -186,6 +284,17 @@ class ImapMailSource:
             raise MailSourceError(f"{what} failed: {typ} {data!r}")
 
 
+def _sleep_out(seconds: float, stop=None) -> bool:
+    """Sleep the remainder of a wait window. Always ``False`` -- no push seen."""
+    if seconds <= 0:
+        return False
+    if stop is not None:
+        stop.wait(seconds)
+    else:
+        time.sleep(seconds)
+    return False
+
+
 def _quote(mailbox: str) -> str:
     """Quote a mailbox name; imaplib passes it through verbatim."""
     if mailbox.startswith('"') and mailbox.endswith('"'):
@@ -198,6 +307,12 @@ class FakeMailSource:
 
     ``fail_times`` makes the next N ``fetch_new`` calls raise a transient error,
     which is how the reconnect/backoff path gets exercised offline.
+
+    ``notify`` is the IDLE half: set the event and the next
+    ``wait_for_activity`` returns immediately, exactly as a server push would.
+    Leave it unset and the call behaves like a server that never pushes, which
+    is how the poll backstop gets tested. ``idle_failures`` makes the next N
+    waits raise, standing in for a dropped IDLE connection.
     """
 
     def __init__(
@@ -205,6 +320,7 @@ class FakeMailSource:
         messages: list[tuple[str, bytes]] | None = None,
         uid_validity: str = "1",
         fail_times: int = 0,
+        idle_failures: int = 0,
     ) -> None:
         self._messages = list(messages or [])
         self._uid_validity = uid_validity
@@ -212,6 +328,9 @@ class FakeMailSource:
         self.fail_times = fail_times
         self.connect_calls = 0
         self.marked: list[str] = []
+        self.notify = threading.Event()
+        self.idle_failures = idle_failures
+        self.waits: list[float] = []
 
     @property
     def uid_validity(self) -> str:
@@ -242,3 +361,27 @@ class FakeMailSource:
     def mark_processed(self, uid: str) -> None:
         self.seen.add(uid)
         self.marked.append(uid)
+
+    def wait_for_activity(self, timeout: float, stop=None) -> bool:
+        """Stand in for IDLE: return on ``notify``, else time out like a poll.
+
+        Honours ``stop`` the same way the real one does -- by checking it
+        between short slices rather than sleeping through it. A fake that
+        ignored it would hang any test whose loop is asked to shut down while
+        waiting, which is precisely the case worth testing.
+        """
+        self.waits.append(timeout)
+        if self.idle_failures > 0:
+            self.idle_failures -= 1
+            raise MailSourceError("simulated IDLE connection drop")
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if stop is not None and stop.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.notify.wait(min(remaining, _FAKE_SLICE_SECONDS)):
+                self.notify.clear()
+                return True

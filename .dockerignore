@@ -5,6 +5,10 @@
 data/
 config/secrets.json
 
+# Holds the bridge-generated IMAP credentials. Compose reads it from the host;
+# no image has any business containing it.
+.env
+
 .git/
 .gitignore
 .pytest_cache/

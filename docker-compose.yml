@@ -1,24 +1,174 @@
-# Email Guard services.
+# Email Guard, end to end.
 #
-# The review console is the first service to land here; the bridge, the
-# dispatcher and the canary join it as each is containerised (root README,
-# "Proposed repository layout").
+#   bridge  ──IMAP──▶  dispatcher  ──docker run --rm──▶  scanner (one per message)
+#                          │                                   │
+#                          └──▶ socket-proxy ──▶ docker.sock    ▼
+#                                                          data volume ◀── webui
 #
-# Two lines in this file are the console's whole exposure story, and they are
-# deliberately next to each other:
+# ---------------------------------------------------------------------------
+# BEFORE `docker compose up`: copy .env.sample to .env and set both paths.
+# ---------------------------------------------------------------------------
 #
-#   * `EMAIL_GUARD_WEBUI_HOST: 0.0.0.0` -- the process must bind the container's
-#     interface, or a published port has nothing to reach.
-#   * `ports: 127.0.0.1:8080:8080` -- and the host publishes it to loopback
-#     only. Drop the `127.0.0.1:` prefix and this console is on the LAN:
-#     it reads mail content and edits the lists that decide whether mail is
-#     delivered, over plain HTTP, with no password unless one is configured.
+# EMAIL_GUARD_HOST_ROOT is not decoration, and it is the single most likely
+# thing to get wrong. The dispatcher asks the *host's* docker daemon to bind
+# directories into each scanner container, and the daemon resolves those paths
+# on the host -- not inside the dispatcher's filesystem. So the dispatcher has
+# to be told where its own mounts live from the host's point of view. Get it
+# wrong and nothing appears broken: the scanner container starts, finds an
+# empty directory where the rules pack should be, and reports a rules-pack
+# error that says nothing whatsoever about mounts. `${VAR:?...}` below turns
+# "unset" into a loud compose failure; "set but wrong" is only detectable on
+# the host, which is what VALIDATION.md is for.
 #
-# Set EMAIL_GUARD_WEBUI_TOKEN in the environment (or a .env file) to require a
-# shared token on every API call. Worth doing on a shared machine, where
-# "loopback" includes every other user on it.
+# EMAIL_GUARD_BRIDGE_CONFIG_DIR must point at an ALREADY-INITIALISED Proton
+# Bridge config directory. This stack deliberately reuses the existing logged-in
+# bridge rather than standing up a fresh one -- an empty volume would force the
+# whole account re-login and keychain dance.
+#
+# The review console's exposure story is still two lines, still deliberately
+# adjacent: `EMAIL_GUARD_WEBUI_HOST: 0.0.0.0` binds the container's interface,
+# `127.0.0.1:8080:8080` publishes it to host loopback only. Drop the
+# `127.0.0.1:` prefix and the console is on the LAN.
 
 services:
+
+  # -- the mail source ------------------------------------------------------
+  bridge:
+    image: shenxn/protonmail-bridge:latest
+    container_name: email-guard-bridge
+    restart: unless-stopped
+    networks: [mail]
+    volumes:
+      # The existing, already-logged-in bridge state. Read-write: the bridge
+      # refreshes its own tokens. See VALIDATION.md before first start -- a
+      # wrong path here looks exactly like "the bridge logged itself out".
+      - "${EMAIL_GUARD_BRIDGE_CONFIG_DIR:?set EMAIL_GUARD_BRIDGE_CONFIG_DIR in .env to your existing Proton Bridge config dir}:/root"
+    # No ports published. The dispatcher reaches it over the `mail` network by
+    # service name; nothing on the host needs to.
+    expose:
+      - "1143"
+
+  # -- the always-on watcher ------------------------------------------------
+  dispatcher:
+    build:
+      context: .
+      dockerfile: dispatcher/Dockerfile
+    image: email-guard-dispatcher:0.1.0
+    container_name: email-guard-dispatcher
+    restart: unless-stopped
+    depends_on: [bridge, docker-socket-proxy]
+    networks: [mail, dockerproxy]
+
+    # Its own uid is what it hands to `docker run --user`, so a root dispatcher
+    # would produce root scanner containers. ContainerRunner refuses to start
+    # if that happens rather than quietly doing it.
+    user: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
+
+    environment:
+      # The deployed dispatcher defaults to the container runner. The *code*
+      # default stays "subprocess" so a plain checkout and the test suite need
+      # no daemon; isolation is a deployment decision, made here.
+      EMAIL_GUARD_SCANNER_RUNNER: "container"
+      EMAIL_GUARD_SCANNER_IMAGE: "email-guard-scanner:0.1.0"
+
+      # Never /var/run/docker.sock. See docker-socket-proxy below.
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+
+      # Both halves of every path mapping: where this container sees a tree,
+      # and where the host daemon must be told to find it.
+      EMAIL_GUARD_CONTAINER_DATA_DIR: "/app/data"
+      EMAIL_GUARD_HOST_DATA_DIR: "${EMAIL_GUARD_HOST_ROOT:?set EMAIL_GUARD_HOST_ROOT in .env to this repo's absolute path on the host}/data"
+      EMAIL_GUARD_CONTAINER_RULES_DIR: "/app/rules"
+      EMAIL_GUARD_HOST_RULES_DIR: "${EMAIL_GUARD_HOST_ROOT}/rules"
+      EMAIL_GUARD_CONTAINER_USER: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
+
+      # The bridge is a service name here, not 127.0.0.1, so its self-signed
+      # certificate is no longer covered by the loopback exemption and must be
+      # verified properly. Point this at the cert the bridge generated (it
+      # lives in the config directory mounted above). VALIDATION.md covers
+      # finding it, and the documented fallback if you cannot.
+      EMAIL_GUARD_IMAP_HOST: "bridge"
+      EMAIL_GUARD_IMAP_PORT: "1143"
+      EMAIL_GUARD_IMAP_TLS: "${EMAIL_GUARD_IMAP_TLS:-starttls}"
+      EMAIL_GUARD_IMAP_CA_FILE: "${EMAIL_GUARD_IMAP_CA_FILE:-}"
+      EMAIL_GUARD_IMAP_MAILBOX: "${EMAIL_GUARD_IMAP_MAILBOX:-INBOX}"
+
+      # Bridge-generated credentials -- not the Proton account password.
+      EMAIL_GUARD_IMAP_USERNAME: "${EMAIL_GUARD_IMAP_USERNAME:?set it in .env}"
+      EMAIL_GUARD_IMAP_PASSWORD: "${EMAIL_GUARD_IMAP_PASSWORD:?set it in .env}"
+
+    volumes:
+      - email-guard-data:/app/data
+      # The rules pack is version-controlled, not runtime data: read-only here,
+      # and read-only again in every scanner container.
+      - ./rules:/app/rules:ro
+      - ./config/config.json:/app/config/config.json:ro
+
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # -- the only container that sees the docker socket -----------------------
+  #
+  # The dispatcher must create containers, and the obvious way to allow that --
+  # bind-mounting /var/run/docker.sock into it -- is host-root-equivalent:
+  # anyone who reaches that socket can start a privileged container mounting /.
+  # Handing it to the process that handles hostile mail would defeat the point
+  # of the per-message sandbox entirely.
+  #
+  # So the socket goes here instead, behind an allow-list, on a network with no
+  # route off this host. Be clear-eyed about what that buys: CONTAINERS + POST
+  # still permits container creation, which is inherently powerful. What it
+  # removes is everything else -- images, volumes, networks, exec, swarm, the
+  # system and info endpoints -- and it keeps the socket itself out of the
+  # dispatcher's mount namespace. A large reduction, not an elimination.
+  #
+  # Keep this list as short as it will go. If the first real `docker run`
+  # returns 403 from the proxy, the fix is HERE, not in the code -- most likely
+  # `IMAGES: 1`, because `docker run` may inspect the local image before
+  # creating a container. Add it only once a call is actually refused, and add
+  # nothing else speculatively. VALIDATION.md has the diagnosis steps.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: email-guard-docker-proxy
+    restart: unless-stopped
+    networks: [dockerproxy]
+    environment:
+      CONTAINERS: 1   # create, inspect, list, wait, remove the scan containers
+      POST: 1         # without this the proxy is read-only and nothing can run
+      # Everything else stays at the image's default of 0. Named explicitly so
+      # that turning one on is a visible, reviewable edit rather than a guess.
+      IMAGES: 0       # <- the likely first addition if `docker run` 403s
+      NETWORKS: 0
+      VOLUMES: 0
+      EXEC: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      INFO: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      AUTH: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /run
+    security_opt:
+      - no-new-privileges:true
+
+  # -- the review console (unchanged) ---------------------------------------
   webui:
     build:
       context: .
@@ -41,9 +191,9 @@ services:
       - "127.0.0.1:8080:8080"
 
     volumes:
-      # The same `data/` the dispatcher and the scanner use: the console reads
-      # the candidates they stage and writes the lists they read back.
-      - ./data:/app/data
+      # The same data the dispatcher and the scanner use: the console reads the
+      # candidates they stage and writes the lists they read back.
+      - email-guard-data:/app/data
       - ./config/config.json:/app/config/config.json:ro
 
     # Nothing outside the mounted data directory is ever written: the applier
@@ -56,3 +206,44 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # -- build-only: the image the dispatcher runs per message ----------------
+  #
+  # Never started. It is here so `docker compose --profile build build scanner`
+  # produces the tag EMAIL_GUARD_SCANNER_IMAGE names -- these two must agree,
+  # or the dispatcher fails per message with "No such image".
+  #
+  # NOTE: scanner containers are created by the dispatcher, not by compose, so
+  # they are not services and will not appear in `docker compose ps`. Find them
+  # with `docker ps --filter label=email-guard.role=scanner`.
+  scanner:
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: scanner/Dockerfile
+    image: email-guard-scanner:0.1.0
+
+networks:
+  # The bridge and the dispatcher. Internal: the bridge has no business being
+  # reachable from anywhere else, and neither does this link.
+  mail:
+    internal: true
+  # The dispatcher and the socket-proxy, and nothing else on the host.
+  dockerproxy:
+    internal: true
+
+volumes:
+  # A named volume, so `docker compose down` and a container recreate cannot
+  # take the done-list with them -- losing data/dispatcher/state.json would
+  # replay the entire mailbox and re-fire every webhook.
+  #
+  # Bound to a known host directory rather than left in docker's own storage,
+  # because the dispatcher must be able to name that host path when it mounts
+  # subdirectories of it into each scanner container. This is the same
+  # constraint EMAIL_GUARD_HOST_ROOT exists for, expressed once more.
+  email-guard-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${EMAIL_GUARD_HOST_ROOT:?set EMAIL_GUARD_HOST_ROOT in .env}/data"

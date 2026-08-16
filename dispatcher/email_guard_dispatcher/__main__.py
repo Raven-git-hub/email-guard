@@ -20,7 +20,7 @@ import threading
 from . import __version__, config
 from .mailsource import ImapMailSource
 from .runner import Runner, describe
-from .scanner_client import ScannerClient
+from .scanner_runner import build_scanner_runner
 from .sinks import build_sinks
 from .state import ProcessedState, StateError
 
@@ -69,10 +69,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
+    try:
+        scanner = build_scanner_runner(settings)
+    except ValueError as exc:
+        # A misconfigured container runner is a startup error on purpose: the
+        # alternative is discovering it one message at a time.
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    # Before anything is drained. A dispatcher killed mid-scan leaves its
+    # container running -- `--rm` only fires on a clean exit -- and those
+    # accumulate across restarts, each still holding its memory and pid quota.
+    _reap_orphans(scanner)
+
     source = ImapMailSource(settings.imap)
     runner = Runner(
         source=source,
-        scanner=ScannerClient(timeout=settings.imap.scan_timeout_seconds),
+        scanner=scanner,
         state=state,
         sinks=build_sinks(settings.webhook_url),
         max_attempts=settings.imap.max_attempts,
@@ -92,6 +105,24 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         source.close()
     return EXIT_OK
+
+
+def _reap_orphans(scanner) -> None:
+    """Ask the runner to clean up after a previous life, if it can.
+
+    Duck-typed: only the container runner has orphans to reap, and a reaping
+    failure must never stop the dispatcher from draining mail.
+    """
+    reap = getattr(scanner, "reap_orphans", None)
+    if not callable(reap):
+        return
+    try:
+        removed = reap()
+    except Exception as exc:  # noqa: BLE001 - housekeeping never blocks the queue
+        log.warning("could not reap orphaned scan containers: %s", exc)
+        return
+    if removed:
+        log.info("reaped %s orphaned scan container(s)", removed)
 
 
 def _drain_once(runner: Runner, source, verbose: bool) -> int:

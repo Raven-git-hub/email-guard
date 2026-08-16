@@ -1,6 +1,10 @@
 """Run the scanner as a subprocess and read its verdict back.
 
-This is the entire dispatcher->scanner interface, and it is intentionally thin.
+One of the two :class:`~.scanner_runner.ScannerRunner` implementations -- the
+one with no isolation, which runs the scanner as a child process sharing this
+host's filesystem, network and kernel. Fine for development and for the test
+suite (no daemon required); :mod:`.container_runner` is what production uses.
+
 The contract it codes against (``scanner/email_guard/cli.py``):
 
 * ``python -m email_guard <path.eml>`` scans one message and files it.
@@ -27,39 +31,18 @@ import os
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
-from typing import Any
+
+from .scanner_runner import ScanOutcome
 
 log = logging.getLogger(__name__)
 
 SCANNER_MODULE = "email_guard"
 STDERR_KEEP = 2000  # enough of the tail to diagnose, short enough to log
 
-
-@dataclass(frozen=True)
-class ScanOutcome:
-    """One scanner run. ``ok`` means exit 0 *and* a parseable verdict."""
-
-    ok: bool
-    exit_code: int
-    verdict: dict[str, Any] | None = None
-    stderr: str = field(default="", repr=False)
-    error: str = ""
-
-    @property
-    def bucket(self) -> str | None:
-        return (self.verdict or {}).get("bucket")
-
-    @property
-    def final_level(self) -> int | None:
-        return (self.verdict or {}).get("final_level")
-
-    @property
-    def sender(self) -> str | None:
-        return (self.verdict or {}).get("sender")
+__all__ = ["ScanOutcome", "ScannerClient", "SubprocessRunner"]
 
 
-class ScannerClient:
+class SubprocessRunner:
     """Invoke ``python -m email_guard`` on raw message bytes."""
 
     def __init__(
@@ -157,3 +140,8 @@ class ScannerClient:
 def _tail(stream: bytes | None) -> str:
     text = (stream or b"").decode("utf-8", errors="replace").strip()
     return text[-STDERR_KEEP:]
+
+
+# The name this class had before there were two runners to choose between. Kept
+# because it is what the README's prose and the existing tests say.
+ScannerClient = SubprocessRunner

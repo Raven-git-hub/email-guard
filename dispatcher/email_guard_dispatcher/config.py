@@ -28,6 +28,16 @@ import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .container_runner import (
+    DEFAULT_CPUS,
+    DEFAULT_IMAGE,
+    DEFAULT_MEMORY,
+    DEFAULT_PIDS_LIMIT,
+    DEFAULT_TMPFS_SIZE,
+    ContainerSettings,
+)
+from .scanner_runner import RUNNERS
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1143
 DEFAULT_MAILBOX = "INBOX"
@@ -35,6 +45,29 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_CONCURRENCY = 4
 DEFAULT_SCAN_TIMEOUT_SECONDS = 120
+
+# IDLE is on by default because on-arrival processing is the point; it is a
+# latency optimisation only, and the poll interval above remains the
+# correctness guarantee whether IDLE works or not.
+DEFAULT_IDLE = True
+# Re-issue IDLE well inside the ~29 minutes RFC 2177 warns a server may allow
+# before dropping an idle connection.
+DEFAULT_IDLE_TIMEOUT_SECONDS = 1500
+
+# The code default is the unsandboxed one: it needs no daemon, so a plain
+# checkout and the test suite work untouched. Compose switches the *deployed*
+# dispatcher to "container", which is where isolation is actually wanted.
+DEFAULT_SCANNER_RUNNER = "subprocess"
+
+# Scanner-side directories. The dispatcher normally has no opinion on these --
+# the scanner resolves its own configuration. The container runner is the
+# exception: it has to name them to mount them.
+DEFAULT_LISTS_DIR = "data/lists"
+DEFAULT_RULES_DIR = "rules"
+DEFAULT_OUTBOUND_DIR = "data/outbound"
+DEFAULT_DAILY_BRIEF_DIR = "data/daily-brief"
+DEFAULT_DATA_DIR = "data"
+DEFAULT_SPOOL_DIR = "data/dispatcher/scan-spool"
 
 # Runtime stores. Both hold personal data -- the state file records which
 # messages arrived, the quarantine log records who sent the ones that failed --
@@ -59,6 +92,31 @@ ENV_SECRETS = "EMAIL_GUARD_SECRETS"
 ENV_USERNAME = "EMAIL_GUARD_IMAP_USERNAME"
 ENV_PASSWORD = "EMAIL_GUARD_IMAP_PASSWORD"
 ENV_WEBHOOK_URL = "EMAIL_GUARD_WEBHOOK_URL"
+ENV_IDLE = "EMAIL_GUARD_IMAP_IDLE"
+
+# Connection overrides. These exist for compose: under it the bridge is reached
+# at a service name rather than 127.0.0.1, and the certificate to trust lives
+# at a path only the deployment knows. config/config.json is shared with the
+# host-run dispatcher and mounted read-only, so it is the wrong place to encode
+# either. Same precedence as everything else: environment beats file.
+ENV_IMAP_HOST = "EMAIL_GUARD_IMAP_HOST"
+ENV_IMAP_PORT = "EMAIL_GUARD_IMAP_PORT"
+ENV_IMAP_TLS = "EMAIL_GUARD_IMAP_TLS"
+ENV_IMAP_CA_FILE = "EMAIL_GUARD_IMAP_CA_FILE"
+ENV_IMAP_MAILBOX = "EMAIL_GUARD_IMAP_MAILBOX"
+ENV_SCANNER_RUNNER = "EMAIL_GUARD_SCANNER_RUNNER"
+ENV_SCANNER_IMAGE = "EMAIL_GUARD_SCANNER_IMAGE"
+ENV_CONTAINER_USER = "EMAIL_GUARD_CONTAINER_USER"
+
+# Both halves of each path mapping. Deliberately *not* named
+# EMAIL_GUARD_RULES_DIR / EMAIL_GUARD_LISTS_DIR: those already belong to the
+# scanner, and the container runner passes them into the scanner container with
+# container-side values. Reusing the names would have the dispatcher's own
+# mount configuration silently become the scanner's path configuration.
+ENV_HOST_DATA_DIR = "EMAIL_GUARD_HOST_DATA_DIR"
+ENV_CONTAINER_DATA_DIR = "EMAIL_GUARD_CONTAINER_DATA_DIR"
+ENV_HOST_RULES_DIR = "EMAIL_GUARD_HOST_RULES_DIR"
+ENV_CONTAINER_RULES_DIR = "EMAIL_GUARD_CONTAINER_RULES_DIR"
 
 
 class ConfigError(ValueError):
@@ -91,6 +149,8 @@ class ImapSettings:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     concurrency: int = DEFAULT_CONCURRENCY
     scan_timeout_seconds: float = DEFAULT_SCAN_TIMEOUT_SECONDS
+    idle: bool = DEFAULT_IDLE
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
     username: str | None = None
     password: str | None = field(default=None, repr=False)
 
@@ -140,6 +200,8 @@ class DispatcherConfig:
     quarantine_log: Path
     webhook_url: str | None = None
     config_path: Path | None = None
+    scanner_runner: str = DEFAULT_SCANNER_RUNNER
+    container: ContainerSettings = field(default_factory=ContainerSettings)
 
 
 def load(
@@ -175,15 +237,17 @@ def load(
 
     username, password = _load_credentials(env, base)
 
-    tls = str(imap_data.get("tls", TLS_STARTTLS)).lower()
+    tls = str(env.get(ENV_IMAP_TLS) or imap_data.get("tls", TLS_STARTTLS)).lower()
     if tls not in TLS_MODES:
-        raise ConfigError(f"config.json: imap.tls must be one of {TLS_MODES}, got {tls!r}")
+        raise ConfigError(f"imap.tls must be one of {TLS_MODES}, got {tls!r}")
 
-    ca_file = imap_data.get("ca_file")
+    ca_file = env.get(ENV_IMAP_CA_FILE) or imap_data.get("ca_file")
     imap = ImapSettings(
-        host=str(imap_data.get("host", DEFAULT_HOST)),
-        port=int(imap_data.get("port", DEFAULT_PORT)),
-        mailbox=mailbox or str(imap_data.get("mailbox", DEFAULT_MAILBOX)),
+        host=str(env.get(ENV_IMAP_HOST) or imap_data.get("host", DEFAULT_HOST)),
+        port=int(env.get(ENV_IMAP_PORT) or imap_data.get("port", DEFAULT_PORT)),
+        mailbox=mailbox
+        or env.get(ENV_IMAP_MAILBOX)
+        or str(imap_data.get("mailbox", DEFAULT_MAILBOX)),
         tls=tls,
         ca_file=_resolve_path(ca_file, base) if ca_file else None,
         poll_interval_seconds=float(
@@ -194,11 +258,28 @@ def load(
         scan_timeout_seconds=float(
             imap_data.get("scan_timeout_seconds", DEFAULT_SCAN_TIMEOUT_SECONDS)
         ),
+        idle=_bool(env.get(ENV_IDLE), imap_data.get("idle"), DEFAULT_IDLE),
+        idle_timeout_seconds=float(
+            imap_data.get("idle_timeout_seconds", DEFAULT_IDLE_TIMEOUT_SECONDS)
+        ),
         username=username,
         password=password,
     )
 
     dispatcher_data = data.get("dispatcher") or {}
+    if not isinstance(dispatcher_data, dict):
+        raise ConfigError("config.json: 'dispatcher' must be an object")
+
+    runner = str(
+        env.get(ENV_SCANNER_RUNNER)
+        or dispatcher_data.get("scanner_runner")
+        or DEFAULT_SCANNER_RUNNER
+    ).strip().lower()
+    if runner not in RUNNERS:
+        raise ConfigError(
+            f"config.json: dispatcher.scanner_runner must be one of {RUNNERS}, got {runner!r}"
+        )
+
     return DispatcherConfig(
         imap=imap,
         state_file=_pick_path(
@@ -209,7 +290,86 @@ def load(
         ),
         webhook_url=env.get(ENV_WEBHOOK_URL) or dispatcher_data.get("webhook_url") or None,
         config_path=used_path,
+        scanner_runner=runner,
+        container=_load_container(data, dispatcher_data, env, base),
     )
+
+
+def _load_container(
+    data: dict, dispatcher_data: dict, env: dict[str, str], base: Path
+) -> ContainerSettings:
+    """The container runner's settings, including both halves of each path map.
+
+    Built unconditionally, even under the subprocess runner: the settings are
+    cheap, and constructing them always means a malformed ``container`` block is
+    reported at startup rather than lying dormant until someone switches
+    runners on a live host. Validation of the *values* is
+    :meth:`ContainerSettings.validate`, which only the container runner calls --
+    a subprocess deployment has no mounts to get wrong.
+
+    The scanner's own directories are read from the *top level* of config.json
+    -- the same keys the scanner reads. That is the one place the dispatcher
+    looks at scanner configuration, and it is unavoidable: something has to
+    name a directory in order to mount it. It is still only paths; nothing here
+    knows what the scanner writes into them.
+    """
+    section = dispatcher_data.get("container") or {}
+    if not isinstance(section, dict):
+        raise ConfigError("config.json: 'dispatcher.container' must be an object")
+
+    data_dir = _resolve_path(
+        env.get(ENV_CONTAINER_DATA_DIR) or section.get("data_dir") or DEFAULT_DATA_DIR, base
+    )
+    rules_dir = _resolve_path(
+        env.get(ENV_CONTAINER_RULES_DIR)
+        or section.get("rules_dir")
+        or data.get("rules_dir")
+        or DEFAULT_RULES_DIR,
+        base,
+    )
+
+    # Host paths default to the dispatcher's own: correct whenever the
+    # dispatcher is NOT itself containerised, where the two are the same
+    # filesystem. Compose overrides them, and getting that wrong is the failure
+    # ContainerRunner's startup validation and VALIDATION.md exist to catch.
+    host_data_dir = Path(env.get(ENV_HOST_DATA_DIR) or section.get("host_data_dir") or data_dir)
+    host_rules_dir = Path(
+        env.get(ENV_HOST_RULES_DIR) or section.get("host_rules_dir") or rules_dir
+    )
+
+    return ContainerSettings(
+        image=env.get(ENV_SCANNER_IMAGE) or section.get("image") or DEFAULT_IMAGE,
+        host_data_dir=host_data_dir,
+        data_dir=data_dir,
+        host_rules_dir=host_rules_dir,
+        rules_dir=rules_dir,
+        lists_dir=_resolve_path(data.get("lists_dir") or DEFAULT_LISTS_DIR, base),
+        outbound_dir=_resolve_path(data.get("outbound_dir") or DEFAULT_OUTBOUND_DIR, base),
+        daily_brief_dir=_resolve_path(
+            data.get("daily_brief_dir") or DEFAULT_DAILY_BRIEF_DIR, base
+        ),
+        spool_dir=_resolve_path(section.get("spool_dir") or DEFAULT_SPOOL_DIR, base),
+        user=str(
+            env.get(ENV_CONTAINER_USER) or section.get("user") or _current_user()
+        ),
+        memory=str(section.get("memory") or DEFAULT_MEMORY),
+        pids_limit=_positive_int(section.get("pids_limit"), DEFAULT_PIDS_LIMIT, "pids_limit"),
+        cpus=str(section.get("cpus") or DEFAULT_CPUS),
+        tmpfs_size=str(section.get("tmpfs_size") or DEFAULT_TMPFS_SIZE),
+        docker_binary=str(section.get("docker_binary") or "docker"),
+    )
+
+
+def _current_user() -> str:
+    """The dispatcher's own uid/gid.
+
+    Inheriting it is what makes the spool files the scanner container writes
+    readable by the dispatcher that has to move them afterwards -- and it means
+    a dispatcher correctly running as non-root produces a non-root scanner for
+    free. A dispatcher running as root is refused by
+    :meth:`ContainerSettings.validate`, which is the intended nudge.
+    """
+    return f"{os.getuid()}:{os.getgid()}"
 
 
 def _load_credentials(env: dict[str, str], base: Path) -> tuple[str | None, str | None]:
@@ -233,6 +393,15 @@ def _load_credentials(env: dict[str, str], base: Path) -> tuple[str | None, str 
         raise ConfigError(f"{path}: 'imap' must be an object")
     # Environment still wins over the file, per the documented order.
     return username or section.get("username"), password or section.get("password")
+
+
+def _bool(env_value, file_value, fallback: bool) -> bool:
+    """Environment first, then the file. ``"0"``/``"false"``/``"no"`` are false."""
+    if env_value is not None and str(env_value).strip() != "":
+        return str(env_value).strip().lower() not in ("0", "false", "no", "off")
+    if file_value is not None:
+        return bool(file_value)
+    return fallback
 
 
 def _positive_int(value, fallback: int, name: str) -> int:

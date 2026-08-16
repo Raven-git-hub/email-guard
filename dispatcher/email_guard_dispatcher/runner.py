@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
 from .mailsource import MailSource
-from .scanner_client import ScanOutcome, ScannerClient
+from .scanner_runner import ScannerRunner, ScanOutcome
 from .sinks import Sink
 from .state import ProcessedState
 
@@ -95,7 +95,7 @@ class Runner:
     def __init__(
         self,
         source: MailSource,
-        scanner: ScannerClient,
+        scanner: ScannerRunner,
         state: ProcessedState,
         sinks: Sequence[Sink],
         *,
@@ -224,12 +224,23 @@ class Runner:
     # -- the long-running loop ------------------------------------------------
 
     def run_forever(self, stop: threading.Event | None = None) -> None:
-        """Poll until stopped. Survives anything transient.
+        """Drain on arrival, and on a timer regardless. Survives anything transient.
 
-        Poll-based on purpose for this build. IMAP IDLE would cut latency from
-        ``poll_interval_seconds`` to near-instant and is the intended next
-        step; it needs a re-IDLE timer and a wakeup path, so the simple loop
-        goes in first.
+        The loop body is unconditionally :meth:`drain_once` -- a full
+        enumeration of the mailbox. What changes between iterations is only how
+        long the wait before the next one was, and why it ended:
+
+        * a **push** (IMAP IDLE) ends it early, which is what makes processing
+          near-instant rather than up to ``poll_interval_seconds`` late;
+        * a **timeout** ends it otherwise, and that is the correctness
+          guarantee -- a full drain happens at least every
+          ``poll_interval_seconds`` whatever the server does or does not
+          announce, so a missed push or a silently-dropped IDLE connection
+          costs latency and cannot strand a message.
+
+        Nothing here ever acts on *which* message was announced. The notifi-
+        cation is a trigger; the mailbox is still the queue and the state file
+        is still the done-list.
         """
         stop = stop or threading.Event()
         backoff = self.reconnect_backoff_seconds
@@ -249,7 +260,26 @@ class Runner:
             backoff = self.reconnect_backoff_seconds
             if report.fetched:
                 log.info("drain: %s", report.summary())
-            stop.wait(self.poll_interval_seconds)
+            self._wait_for_work(stop, self.poll_interval_seconds)
+
+    def _wait_for_work(self, stop: threading.Event, timeout: float) -> None:
+        """Wait for a push, or for the poll deadline -- whichever comes first.
+
+        Duck-typed like :meth:`_connect`: a source that cannot push simply does
+        not have ``wait_for_activity``, and the plain sleep is used instead.
+        The source is contracted not to raise, but the guard stays anyway --
+        this is the one call between drains, and an exception escaping it would
+        be indistinguishable from a drain failure and would trigger a pointless
+        reconnect.
+        """
+        waiter = getattr(self.source, "wait_for_activity", None)
+        if callable(waiter):
+            try:
+                waiter(timeout, stop)
+                return
+            except Exception as exc:  # noqa: BLE001 - degrade to the poll schedule
+                log.warning("wait_for_activity failed (%s); sleeping instead", exc)
+        stop.wait(timeout)
 
     def _connect(self) -> None:
         connect = getattr(self.source, "connect", None)

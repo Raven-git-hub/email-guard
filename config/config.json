@@ -13,13 +13,24 @@
     "poll_interval_seconds": 30,
     "max_attempts": 3,
     "concurrency": 4,
-    "scan_timeout_seconds": 120
+    "scan_timeout_seconds": 120,
+    "idle": true,
+    "idle_timeout_seconds": 1500
   },
 
   "dispatcher": {
     "state_file": "data/dispatcher/state.json",
     "quarantine_log": "data/dispatcher/quarantine.log",
-    "webhook_url": null
+    "webhook_url": null,
+    "scanner_runner": "subprocess",
+    "container": {
+      "image": "email-guard-scanner:0.1.0",
+      "memory": "512m",
+      "pids_limit": 128,
+      "cpus": "1.0",
+      "tmpfs_size": "64m",
+      "spool_dir": "data/dispatcher/scan-spool"
+    }
   },
 
   "webui": {

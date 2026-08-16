@@ -20,6 +20,14 @@ data/dispatcher/**
 # dispatcher against the Proton bridge"). The sample stays. ---
 config/secrets.json
 
+# --- Compose environment: holds the bridge credentials and the host paths of
+# this deployment. The sample stays. ---
+.env
+
+# The bridge's own certificate, if it is copied here for the dispatcher to
+# verify against. Not secret, but it is host-specific deployment state.
+config/bridge-cert.pem
+
 # --- Python ---
 __pycache__/
 *.py[cod]
