@@ -33,7 +33,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi", reason="the web UI needs the 'webui' extra")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from email_guard.lists import Lists  # noqa: E402
+from email_guard.lists import GREYLIST_KNOWN, Lists, classify_greylist, tags_of  # noqa: E402
 from email_guard.propose import CANDIDATE_NAME, CANDIDATE_VERSION, brief_dir_name  # noqa: E402
 from email_guard_webui.app import create_app  # noqa: E402
 from email_guard_webui.config import AUTH_HEADER, WebUIConfig, content_security_policy  # noqa: E402
@@ -294,6 +294,327 @@ def test_an_unreadable_candidate_does_not_hide_the_rest(client, daily_brief_dir)
     payload = client.get("/api/candidates").json()
 
     assert [card["id"] for card in payload["candidates"]] == [f"{brief_dir_name(DAY)}/job-a"]
+
+
+# --- the queue is live against the current lists --------------------------------
+#
+# A candidate was staged against the lists as they stood then. These pin that the
+# queue re-asks the question against the lists as they stand NOW, using the real
+# matching -- `lists.find_entry` and `lists.structure_matches` by way of
+# `propose.classify` -- rather than a second implementation of the rule that
+# could drift from the scanner's.
+
+
+HSBC_SENDER = "alerts@hsbc.example"
+
+
+def test_a_candidate_whose_sender_is_now_whitelisted_drops_out(client, lists_dir, daily_brief_dir):
+    stage_candidate(daily_brief_dir, "job-a")
+    assert client.get("/api/candidates").json()["count"] == 1
+
+    write_lists(lists_dir, whitelist=[{"email": UNKNOWN_SENDER}])
+
+    payload = client.get("/api/candidates").json()
+    assert payload["count"] == 0
+    assert payload["suppressed"] == 1
+
+
+def test_a_candidate_whose_sender_is_now_blacklisted_drops_out(client, lists_dir, daily_brief_dir):
+    stage_candidate(daily_brief_dir, "job-a")
+
+    write_lists(lists_dir, blacklist=[{"domain": UNKNOWN_DOMAIN}])
+
+    assert client.get("/api/candidates").json()["count"] == 0
+
+
+def test_a_candidate_matching_an_allowed_structure_drops_out(client, daily_brief_dir):
+    """Its shape is catalogued and it would now clear -- nothing left to decide."""
+    stage_candidate(
+        daily_brief_dir,
+        "job-a",
+        sender=HSBC_SENDER,
+        subject="Your payment is due",
+        excerpt="A payment of 42.10 is scheduled for Friday.",
+    )
+
+    assert client.get("/api/candidates").json()["count"] == 0
+
+
+def test_a_candidate_matching_a_denied_structure_drops_out(client, daily_brief_dir):
+    """Catalogued is catalogued: a denied shape is as decided as an allowed one.
+
+    The scanner skips it for the same reason -- the reviewer has already seen
+    this shape and rejected it.
+    """
+    stage_candidate(
+        daily_brief_dir,
+        "job-a",
+        sender=HSBC_SENDER,
+        subject="Weekend offer inside",
+        excerpt="Our best offer yet on savings accounts.",
+    )
+
+    assert client.get("/api/candidates").json()["count"] == 0
+
+
+def test_the_genuinely_unresolved_still_show(client, daily_brief_dir):
+    """The two cards a human still has to answer, and only those.
+
+    An unknown domain, and a greylisted sender whose message matches none of
+    that domain's structures. Everything else in this section is suppressed.
+    """
+    stage_candidate(daily_brief_dir, "job-a")  # unknown domain
+    stage_candidate(
+        daily_brief_dir,
+        "job-b",
+        sender=HSBC_SENDER,
+        subject="Something entirely new",
+        excerpt="Nothing here resembles a catalogued shape.",
+    )
+    stage_candidate(daily_brief_dir, "job-c", sender="scam@fakeemail.example")  # blacklisted
+
+    payload = client.get("/api/candidates").json()
+
+    assert [card["id"] for card in payload["candidates"]] == [
+        f"{brief_dir_name(DAY)}/job-a",
+        f"{brief_dir_name(DAY)}/job-b",
+    ]
+    assert payload["suppressed"] == 1
+    # The greylisted one is shown *as* a greylist member: suppression is about
+    # whether a decision is still needed, not about whether the sender is listed.
+    assert payload["candidates"][1]["membership"]["list"] == "greylist"
+
+
+def test_a_matching_parent_domain_structure_suppresses_a_subdomain_sender(client, daily_brief_dir):
+    """Subdomain-inclusive, because `find_entries` is -- the engine's own rule."""
+    stage_candidate(
+        daily_brief_dir,
+        "job-a",
+        sender="noreply@notify.hsbc.example",
+        subject="Payment received",
+        excerpt="Your payment has been received.",
+    )
+
+    assert client.get("/api/candidates").json()["count"] == 0
+
+
+def test_suppression_is_a_filter_and_never_a_move(client, lists_dir, daily_brief_dir):
+    """Non-destructive: the staged file stays put, and the card comes back.
+
+    Only a decision consumes a candidate. A card suppressed because a sender was
+    listed returns if that entry is later removed -- which is what makes the
+    queue a *view* of the staged tree rather than a second store of its own.
+    """
+    path = stage_candidate(daily_brief_dir, "job-a")
+    write_lists(lists_dir, whitelist=[{"email": UNKNOWN_SENDER}])
+    assert client.get("/api/candidates").json()["count"] == 0
+    assert path.is_file()
+
+    write_lists(lists_dir)
+
+    assert client.get("/api/candidates").json()["count"] == 1
+
+
+def test_listing_a_sender_clears_their_whole_backlog(client, daily_brief_dir):
+    """The point of the whole filter: one decision answers every pending card.
+
+    Three cards from one subscription sender, staged before anybody listed it.
+    Deciding the first suppresses the other two on the next read, without a
+    second click and without touching their files.
+    """
+    for job in ("job-a", "job-b", "job-c"):
+        stage_candidate(daily_brief_dir, job, subject=f"Invoice {job}")
+    assert client.get("/api/candidates").json()["count"] == 3
+
+    client.post(
+        "/api/decisions",
+        json={
+            "candidate": f"{brief_dir_name(DAY)}/job-a",
+            "action": "whitelist",
+            "entry": {"email": UNKNOWN_SENDER},
+        },
+    )
+
+    payload = client.get("/api/candidates").json()
+    assert payload["count"] == 0
+    assert payload["suppressed"] == 2
+
+
+# --- trust all mail from this sender --------------------------------------------
+
+
+def test_trust_all_writes_the_catch_all_and_consumes_the_candidate(
+    client, lists_dir, daily_brief_dir
+):
+    path = stage_candidate(daily_brief_dir, "job-a")
+
+    response = client.post(
+        "/api/decisions/trust-all",
+        json={
+            "candidate": f"{brief_dir_name(DAY)}/job-a",
+            "domain": UNKNOWN_DOMAIN,
+            "tags": ["invoices"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["consumed"] is True
+    entry = [e for e in entries_of(lists_dir, "greylist") if e["domain"] == UNKNOWN_DOMAIN][0]
+    assert entry["known_structures"] == [
+        {"name": "ALL EMAILS", "key_phrases": [], "disposition": "allowed", "tags": ["invoices"]}
+    ]
+    assert (path.parent / "reviewed" / CANDIDATE_NAME).is_file()
+
+
+def test_trust_all_clears_the_senders_other_cards(client, daily_brief_dir):
+    """Fix 2 and Fix 1 meeting: one click, and the backlog goes with it.
+
+    The invoice sender whose every subject carries a different reference stages
+    a card per message. Trusting the domain consumes the card on screen, and the
+    rest are suppressed by the queue filter because they now match a structure.
+    """
+    for job in ("job-a", "job-b", "job-c"):
+        stage_candidate(daily_brief_dir, job, subject=f"Invoice INV-{job}", excerpt=f"see {job}")
+    assert client.get("/api/candidates").json()["count"] == 3
+
+    client.post(
+        "/api/decisions/trust-all",
+        json={"candidate": f"{brief_dir_name(DAY)}/job-a", "domain": UNKNOWN_DOMAIN, "tags": []},
+    )
+
+    assert client.get("/api/candidates").json()["count"] == 0
+
+
+def test_trust_all_is_idempotent(client, lists_dir, daily_brief_dir):
+    stage_candidate(daily_brief_dir, "job-a")
+    body = {
+        "candidate": f"{brief_dir_name(DAY)}/job-a",
+        "domain": UNKNOWN_DOMAIN,
+        "tags": ["invoices"],
+    }
+
+    assert client.post("/api/decisions/trust-all", json=body).json()["consumed"] is True
+    after_first = snapshot(lists_dir)
+
+    second = client.post("/api/decisions/trust-all", json=body)
+
+    assert second.status_code == 200
+    assert second.json()["consumed"] is False
+    assert snapshot(lists_dir) == after_first
+
+
+def test_trust_all_preserves_mutual_exclusivity(client, lists_dir, daily_brief_dir):
+    """A trusted domain leaves whichever list it was on, like any decision."""
+    stage_candidate(daily_brief_dir, "job-a", sender="payments@hsbc.example")
+
+    response = client.post(
+        "/api/decisions/trust-all",
+        json={
+            "candidate": f"{brief_dir_name(DAY)}/job-a",
+            "domain": "hsbc.example",
+            "tags": ["bank"],
+        },
+    )
+    assert response.status_code == 200
+
+    client.post(
+        "/api/lists/blacklist/add", json={"entry": {"domain": "hsbc.example"}}
+    )
+
+    assert not any(e.get("domain") == "hsbc.example" for e in entries_of(lists_dir, "greylist"))
+    assert "hsbc.example" in {e.get("domain") for e in entries_of(lists_dir, "blacklist")}
+    # And the lists the engine loads are still the ones it will accept.
+    assert Lists.load(lists_dir)
+
+
+def test_a_trusted_sender_is_cleared_by_the_engine(client, lists_dir, daily_brief_dir):
+    """What the console wrote, the engine now reads as "trust everything"."""
+    stage_candidate(daily_brief_dir, "job-a")
+
+    client.post(
+        "/api/decisions/trust-all",
+        json={
+            "candidate": f"{brief_dir_name(DAY)}/job-a",
+            "domain": UNKNOWN_DOMAIN,
+            "tags": ["invoices"],
+        },
+    )
+
+    lists = Lists.load(lists_dir)
+    classification, _, matched = classify_greylist(
+        lists.greylist, UNKNOWN_SENDER, UNKNOWN_DOMAIN, "Anything at all", "never seen before"
+    )
+    assert classification == GREYLIST_KNOWN
+    assert tags_of(matched) == ["invoices"]
+
+
+def test_trust_all_cannot_smuggle_a_structure_or_an_action(client, lists_dir, daily_brief_dir):
+    """One click means one thing: the body has nowhere to put anything else."""
+    stage_candidate(daily_brief_dir, "job-a")
+    before = snapshot(lists_dir)
+    candidate_id = f"{brief_dir_name(DAY)}/job-a"
+
+    for body in (
+        {"candidate": candidate_id, "domain": UNKNOWN_DOMAIN, "action": "blacklist"},
+        {
+            "candidate": candidate_id,
+            "domain": UNKNOWN_DOMAIN,
+            "structure": {"name": "S", "key_phrases": ["s"]},
+        },
+        {"candidate": candidate_id, "email": UNKNOWN_SENDER},
+    ):
+        assert client.post("/api/decisions/trust-all", json=body).status_code == 422
+
+    assert snapshot(lists_dir) == before
+    assert client.get("/api/candidates").json()["count"] == 1
+
+
+def test_an_invalid_trust_all_is_rejected_and_changes_nothing(client, lists_dir, daily_brief_dir):
+    """A card with no domain to trust is the applier's error to report, not ours.
+
+    The console does not pre-validate -- the applier owns the rules, and
+    answering them twice is how two answers start disagreeing. So an empty
+    domain comes back as its "needs exactly one of 'email' or 'domain'", with
+    the candidate still in the queue.
+    """
+    stage_candidate(daily_brief_dir, "job-a")
+    before = snapshot(lists_dir)
+
+    response = client.post(
+        "/api/decisions/trust-all",
+        json={"candidate": f"{brief_dir_name(DAY)}/job-a", "domain": "  "},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"]
+    assert snapshot(lists_dir) == before
+    assert client.get("/api/candidates").json()["count"] == 1
+
+
+def test_the_trust_all_control_is_wired_the_way_the_csp_requires(client):
+    """The new control obeys the two rules the whole console is built on."""
+    script = client.get("/static/app.js").text
+
+    assert "buildTrustBox" in script
+    assert "/api/decisions/trust-all" in script
+    # Built with the el() helper and bound with addEventListener -- no markup
+    # string, no inline handler. (`test_the_client_has_no_way_to_turn_a_body_
+    # into_markup` pins the absence of every HTML sink for the whole file.)
+    assert "el('div', 'trust-box')" in script
+    assert "button.addEventListener('click', () => { trustAllSender(); });" in script
+
+
+def test_the_trust_all_response_carries_the_csp(client, daily_brief_dir):
+    stage_candidate(daily_brief_dir, "job-a")
+
+    response = client.post(
+        "/api/decisions/trust-all",
+        json={"candidate": f"{brief_dir_name(DAY)}/job-a", "domain": UNKNOWN_DOMAIN},
+    )
+
+    assert response.status_code == 200
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+    assert response.headers["cache-control"] == "no-store"
 
 
 # --- decisions -----------------------------------------------------------------

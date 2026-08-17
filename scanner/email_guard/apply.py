@@ -8,15 +8,25 @@ so only from an approved decisions document:
     { "decisions_version": 1, "reviewed": "<YYYY-MM-DD>",
       "decisions": [
         { "candidate": "<job-or-domain>",
-          "action": "whitelist" | "greylist" | "blacklist" | "discard",
+          "action": "whitelist" | "greylist" | "trust_all" | "blacklist" | "discard",
           "entry":     { "email"|"domain", "friendly_name"?, "tags": [] },
           "structure": { "name", "key_phrases": [], "disposition", "tags": [] } } ] }
 
-``entry`` names the *subject* of a decision and is required for all three list
+``entry`` names the *subject* of a decision and is required for all four list
 actions -- a greylist decision needs a target domain like any other. ``structure``
 says what to catalogue and is greylist-only; a greylist decision without one just
 creates the entry, whose shapes then all come back ``new_structure`` for review.
 ``discard`` drops the candidate and touches nothing.
+
+``trust_all`` is the greylist action for a sender whose *every* message is
+wanted: it writes the domain's greylist entry with the ``"ALL EMAILS"``
+catch-all structure -- empty ``key_phrases``, disposition ``allowed``, carrying
+the entry's ``tags`` -- which :func:`email_guard.lists.structure_matches` reads
+as "match every message from this sender". It therefore carries no ``structure``
+of its own: the action *is* the structure. Any denied shape already catalogued
+on that domain still wins, because :func:`email_guard.lists.classify_greylist`
+scans every structure before trusting an allowed match -- trusting a sender
+wholesale does not un-block the one shape from them a reviewer rejected.
 
 Four guarantees, in the order they matter:
 
@@ -57,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 from .lists import (
+    DISPOSITION_ALLOWED,
     DISPOSITIONS,
     LIST_NAMES,
     MATCH_ALL_NAME,
@@ -70,10 +81,22 @@ DECISIONS_VERSION = 1
 
 ACTION_WHITELIST = "whitelist"
 ACTION_GREYLIST = "greylist"
+ACTION_TRUST_ALL = "trust_all"
 ACTION_BLACKLIST = "blacklist"
 ACTION_DISCARD = "discard"
-LIST_ACTIONS = (ACTION_WHITELIST, ACTION_GREYLIST, ACTION_BLACKLIST)
+LIST_ACTIONS = (ACTION_WHITELIST, ACTION_GREYLIST, ACTION_TRUST_ALL, ACTION_BLACKLIST)
 ACTIONS = LIST_ACTIONS + (ACTION_DISCARD,)
+
+# Which list an action writes to. Everything but ``trust_all`` names its own
+# list; ``trust_all`` is a greylist decision with the catch-all shape already
+# decided, so every rule keyed on the target list -- mutual exclusivity above
+# all -- has to read the list, never the action.
+TARGET_LIST = {
+    ACTION_WHITELIST: ACTION_WHITELIST,
+    ACTION_GREYLIST: ACTION_GREYLIST,
+    ACTION_TRUST_ALL: ACTION_GREYLIST,
+    ACTION_BLACKLIST: ACTION_BLACKLIST,
+}
 
 LIST_FILES = {name: f"{name}.json" for name in LIST_NAMES}
 
@@ -86,6 +109,23 @@ OP_DISCARD = "discard"
 OP_NO_OP = "no_op"
 
 MATCH_ALL_STRUCTURE = {"name": MATCH_ALL_NAME, "key_phrases": []}
+
+
+def catch_all_structure(tags: list[str] | None = None) -> dict[str, Any]:
+    """The ``"ALL EMAILS"`` structure a ``trust_all`` decision writes.
+
+    Empty ``key_phrases`` *and* the match-all name, either of which
+    :func:`email_guard.lists.structure_matches` reads as "every message from
+    this sender". Both are set because the two spellings mean the same thing and
+    a list is read by a human: the name says what it is, the empty phrase list
+    makes it true even if the name is later edited.
+    """
+    return {
+        "name": MATCH_ALL_NAME,
+        "key_phrases": [],
+        "disposition": DISPOSITION_ALLOWED,
+        "tags": list(tags or []),
+    }
 
 
 class InvalidDecisions(Exception):
@@ -272,8 +312,8 @@ def _validate_decision(
         errors.append(f"{where}: 'entry' needs exactly one of 'email' or 'domain'")
     elif email and "@" not in email:
         errors.append(f"{where}: entry email {email!r} has no domain part")
-    if action == ACTION_GREYLIST and email:
-        errors.append(f"{where}: greylist entries key on 'domain', not 'email'")
+    if TARGET_LIST[action] == ACTION_GREYLIST and email:
+        errors.append(f"{where}: {action} entries key on 'domain', not 'email'")
 
     friendly_name = entry.get("friendly_name")
     if friendly_name is not None and not isinstance(friendly_name, str):
@@ -282,20 +322,30 @@ def _validate_decision(
 
     structure = decision.get("structure")
     if structure is not None:
-        if action != ACTION_GREYLIST:
+        if action == ACTION_TRUST_ALL:
+            # Not a repair: a trust_all carrying a structure means the caller
+            # believes it is cataloguing one shape, and it is about to trust
+            # every shape. That is worth refusing rather than half-honouring.
+            errors.append(
+                f"{where}: a {ACTION_TRUST_ALL} decision carries no 'structure' -- "
+                f"it writes the {MATCH_ALL_NAME!r} catch-all itself"
+            )
+        elif action != ACTION_GREYLIST:
             errors.append(f"{where}: only a greylist decision carries a 'structure'")
         else:
             errors.extend(_validate_structure(where, structure))
 
     # Two decisions sending one domain to two different lists would be resolved
-    # by document order, which is not a decision anybody made.
+    # by document order, which is not a decision anybody made. Compared by
+    # target list, not by action: a greylist and a trust_all for one domain
+    # agree about where it lives, and the applier folds both into one entry.
     if not errors:
         claim = claimed_domain(entry)
         held = claims.get(claim)
-        if held is not None and held[2] != action:
+        if held is not None and TARGET_LIST[held[2]] != TARGET_LIST[action]:
             errors.append(
-                f"{where}: claims '{claim}' for the {action}, but decisions[{held[0]}] "
-                f"(candidate {held[1]!r}) claims it for the {held[2]}"
+                f"{where}: claims '{claim}' for the {TARGET_LIST[action]}, but decisions[{held[0]}] "
+                f"(candidate {held[1]!r}) claims it for the {TARGET_LIST[held[2]]}"
             )
         claims.setdefault(claim, (index, candidate, action))
 
@@ -440,13 +490,21 @@ def _apply_one(files: dict[str, ListFile], decision: dict[str, Any], report: _Re
     spec = decision["entry"]
     key = entry_key(spec)
     domain = claimed_domain(spec)
+    # The list this action writes to -- which is the greylist for a trust_all,
+    # so exclusivity clears the *other two* lists and not the one being written.
+    target = TARGET_LIST[action]
 
-    _remove_conflicts(files, candidate, action, domain, report)
+    _remove_conflicts(files, candidate, target, domain, report)
 
-    if action == ACTION_GREYLIST:
-        _apply_greylist(files[action], candidate, spec, decision.get("structure"), report)
+    if target == ACTION_GREYLIST:
+        structure = (
+            catch_all_structure(tags_of(spec))
+            if action == ACTION_TRUST_ALL
+            else decision.get("structure")
+        )
+        _apply_greylist(files[target], candidate, spec, structure, report)
     else:
-        _apply_address_list(files[action], candidate, action, spec, key, report)
+        _apply_address_list(files[target], candidate, target, spec, key, report)
 
 
 def _remove_conflicts(

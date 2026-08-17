@@ -411,6 +411,216 @@ def test_applying_to_a_known_grey_domain_appends_to_the_existing_entry(live_list
     ]
 
 
+# --- trust_all: the catch-all decision -----------------------------------------
+
+
+def trust_all_decision(domain: str, *tags: str, candidate: str | None = None) -> dict:
+    return {
+        "candidate": candidate or f"job-{domain}",
+        "action": "trust_all",
+        "entry": {"domain": domain, "tags": list(tags)},
+    }
+
+
+def test_trust_all_writes_the_catch_all_structure(live_lists):
+    """One decision, one entry, one ``ALL EMAILS`` shape carrying the tags.
+
+    Empty ``key_phrases`` and the match-all name, which is what
+    :func:`email_guard.lists.structure_matches` reads as "every message from
+    this sender". The reviewer's tags land on the structure, because that is
+    where the pipeline reads the labels a cleared verdict carries.
+    """
+    result = apply_decisions(
+        document(trust_all_decision(UNKNOWN_DOMAIN, "invoices", "finance")), live_lists
+    )
+
+    entries = [e for e in read_list(live_lists, "greylist") if e["domain"] == UNKNOWN_DOMAIN]
+    assert len(entries) == 1
+    assert entries[0]["known_structures"] == [
+        {
+            "name": "ALL EMAILS",
+            "key_phrases": [],
+            "disposition": "allowed",
+            "tags": ["invoices", "finance"],
+        }
+    ]
+    assert entries[0]["tags"] == ["invoices", "finance"]
+    # Reported as a greylist change, because that is the list it wrote.
+    assert {change["list"] for change in result["changes"]} == {"greylist"}
+    assert [c["operation"] for c in result["changes"]] == ["add_entry", "add_structure"]
+
+
+def test_re_applying_trust_all_changes_nothing(live_lists):
+    doc = document(trust_all_decision(UNKNOWN_DOMAIN, "invoices"))
+    apply_decisions(doc, live_lists)
+    after_first = list_bytes(live_lists)
+
+    result = apply_decisions(doc, live_lists)
+
+    assert list_bytes(live_lists) == after_first
+    assert result["written"] == []
+    assert all(change["operation"] == "no_op" for change in result["changes"])
+
+
+def test_trust_all_adds_the_catch_all_to_an_existing_entry(live_lists):
+    """A domain already on the greylist keeps its shapes and gains the catch-all."""
+    result = apply_decisions(
+        document(trust_all_decision("northgate-bank.example", "bank")), live_lists
+    )
+
+    entries = [
+        e for e in read_list(live_lists, "greylist") if e["domain"] == "northgate-bank.example"
+    ]
+    assert len(entries) == 1
+    assert [s["name"] for s in entries[0]["known_structures"]] == [
+        "Northgate Statement Ready",
+        "Northgate Fund Transfer Advice",
+        "ALL EMAILS",
+    ]
+    assert [c["operation"] for c in result["changes"]] == ["update_entry", "add_structure"]
+
+
+def test_trust_all_replaces_an_existing_catch_all(live_lists):
+    """Re-trusting with different tags updates the shape rather than duplicating it.
+
+    ``mixedsignals.example`` already carries an ``ALL EMAILS`` structure tagged
+    ``bulk``; trusting it again re-tags that one structure.
+    """
+    result = apply_decisions(
+        document(trust_all_decision("mixedsignals.example", "newsletter")), live_lists
+    )
+
+    entry = next(
+        e for e in read_list(live_lists, "greylist") if e["domain"] == "mixedsignals.example"
+    )
+    catch_alls = [s for s in entry["known_structures"] if s["name"] == "ALL EMAILS"]
+    assert len(catch_alls) == 1
+    assert catch_alls[0]["tags"] == ["newsletter"]
+    assert "update_structure" in {c["operation"] for c in result["changes"]}
+
+
+def test_trust_all_takes_the_domain_off_the_list_it_was_on(live_lists):
+    """Mutual exclusivity, inherited whole: a trust_all is a greylist decision."""
+    apply_decisions(
+        document(
+            {
+                "candidate": "job-friend",
+                "action": "blacklist",
+                "entry": {"domain": UNKNOWN_DOMAIN},
+            }
+        ),
+        live_lists,
+    )
+
+    result = apply_decisions(document(trust_all_decision(UNKNOWN_DOMAIN, "invoices")), live_lists)
+
+    assert not any(e.get("domain") == UNKNOWN_DOMAIN for e in read_list(live_lists, "blacklist"))
+    assert any(e.get("domain") == UNKNOWN_DOMAIN for e in read_list(live_lists, "greylist"))
+    removals = [c for c in result["changes"] if c["operation"] == "remove_entry"]
+    assert [c["list"] for c in removals] == ["blacklist"]
+    # ... and the greylist it writes is not the list it clears.
+    assert Lists.load(live_lists).find("greylist", f"sam@{UNKNOWN_DOMAIN}", UNKNOWN_DOMAIN)
+
+
+def test_a_greylist_and_a_trust_all_for_one_domain_are_not_a_conflict(live_lists):
+    """Both name the greylist, so both apply -- the conflict rule is per list."""
+    apply_decisions(
+        document(
+            greylist_decision(UNKNOWN_DOMAIN, structure("Bait", "Subject: Reset", disposition="denied")),
+            trust_all_decision(UNKNOWN_DOMAIN, "invoices"),
+        ),
+        live_lists,
+    )
+
+    entry = next(e for e in read_list(live_lists, "greylist") if e["domain"] == UNKNOWN_DOMAIN)
+    assert [s["name"] for s in entry["known_structures"]] == ["Bait", "ALL EMAILS"]
+
+
+def test_trusting_a_sender_does_not_unblock_a_shape_already_denied(live_lists, rescan):
+    """The one thing "trust everything" must not do.
+
+    ``mixedsignals.example`` has a denied ``Password Reset Bait`` shape. Adding
+    the catch-all clears its ordinary mail; the bait is still rejected, because
+    :func:`email_guard.lists.classify_greylist` scans every structure before
+    trusting an allowed match.
+    """
+    apply_decisions(document(trust_all_decision("mixedsignals.example", "newsletter")), live_lists)
+
+    ordinary = rescan(eml("Tuesday roundup", sender="news@mixedsignals.example"), live_lists)
+    assert ordinary["bucket"] == "cleared"
+    assert ordinary["tags"] == ["newsletter"]
+
+    bait = rescan(eml("Reset your password", sender="news@mixedsignals.example"), live_lists)
+    assert bait["greylist_classification"] == "denied"
+    assert bait["bucket"] == "rejected"
+
+
+def test_trust_all_clears_every_shape_from_that_sender(live_lists, stage, rescan):
+    """The subscription case, end to end, through the real engine.
+
+    An unknown sender stages a candidate; the reviewer trusts the domain
+    wholesale; afterwards *every* message from it clears with the tags —
+    including one whose subject and body the reviewer has never seen, which is
+    exactly what a per-message reference in every subject line defeats.
+    """
+    raw = eml("Invoice INV-88213 for July", body="Your invoice is attached.")
+
+    staged = stage(raw, live_lists)
+    assert staged["proposal"]["classification"] == "unknown_domain"
+
+    apply_decisions(document(trust_all_decision(UNKNOWN_DOMAIN, "invoices", "finance")), live_lists)
+
+    for subject in ("Invoice INV-88213 for July", "Invoice INV-99117 for August"):
+        verdict = rescan(eml(subject, body="Your invoice is attached."), live_lists)
+        assert verdict["greylist_classification"] == GREYLIST_KNOWN
+        assert verdict["bucket"] == "cleared"
+        assert verdict["tags"] == ["invoices", "finance"]
+        # Nothing left to review, so the scanner stages no further candidate.
+        assert verdict["proposal"]["classification"] == "skip"
+
+
+@pytest.mark.parametrize(
+    "decision, fragment",
+    [
+        (
+            {"candidate": "c", "action": "trust_all", "entry": {"email": "a@x.example"}},
+            "trust_all entries key on 'domain'",
+        ),
+        (
+            {
+                "candidate": "c",
+                "action": "trust_all",
+                "entry": {"domain": "x.example"},
+                "structure": {"name": "S", "key_phrases": ["s"]},
+            },
+            "carries no 'structure'",
+        ),
+        (
+            {
+                "candidate": "c",
+                "action": "trust_all",
+                "entry": {"domain": "x.example", "tags": "invoices"},
+            },
+            "'tags' must be a list",
+        ),
+    ],
+    ids=["keyed-on-email", "carrying-a-structure", "tags-not-a-list"],
+)
+def test_a_malformed_trust_all_is_rejected_and_writes_nothing(live_lists, decision, fragment):
+    """A structure on a trust_all is refused, not half-honoured.
+
+    It means the caller believes it is cataloguing one shape while the applier
+    is about to trust every shape -- a disagreement worth failing on.
+    """
+    before = list_bytes(live_lists)
+
+    with pytest.raises(InvalidDecisions) as caught:
+        apply_decisions(document(decision), live_lists)
+
+    assert any(fragment in error for error in caught.value.errors)
+    assert list_bytes(live_lists) == before
+
+
 def test_discard_touches_nothing(live_lists):
     before = list_bytes(live_lists)
 

@@ -6,7 +6,7 @@ The scanner stages one proposal per unfamiliar sender at
 into the small object the review card needs, and -- once a decision has been
 applied -- consumes it so it does not come back on reload.
 
-Three rules the rest of the component depends on:
+Four rules the rest of the component depends on:
 
 * **A card carries plain text only.** ``body`` is the candidate's ``excerpt``
   and nothing else: the scanner's ``clean_text``, HTML already stripped and
@@ -20,6 +20,14 @@ Three rules the rest of the component depends on:
   ``reviewed/`` sibling. The proposal that produced a list change is evidence,
   and the daily-brief tree is already git-ignored personal data, so keeping it
   costs nothing and losing it costs the audit trail.
+* **The queue is live against the current lists.** A candidate was staged
+  against the lists as they stood *then*; :func:`needs_review` re-asks the
+  scanner's own question against the lists as they stand *now*, and the queue
+  endpoint drops the ones already answered. Listing a sender therefore clears
+  their pending cards, and a greylisted subscription stops generating a card per
+  message the moment one structure covers it. The filter is non-destructive:
+  nothing moves on disk, so a suppressed candidate returns if the entry that
+  covered it is later removed.
 """
 
 from __future__ import annotations
@@ -33,8 +41,8 @@ from pathlib import Path
 from typing import Any
 
 from email_guard.clean.common import obfuscation_flags
-from email_guard.lists import LIST_NAMES, Lists, entry_key, find_entry
-from email_guard.propose import CANDIDATE_NAME
+from email_guard.lists import LIST_NAMES, Lists, classify_greylist, entry_key, find_entry
+from email_guard.propose import CANDIDATE_NAME, classify, wants_candidate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +92,50 @@ def queue(daily_brief_dir: str | Path) -> list[Candidate]:
             Candidate(id=f"{path.parent.parent.name}/{path.parent.name}", path=path, document=document)
         )
     return candidates
+
+
+def needs_review(candidate: Candidate, lists: Lists) -> bool:
+    """Does this staged candidate still need a human decision?
+
+    Asked by re-running the scanner's own staging rule --
+    :func:`email_guard.propose.classify` over
+    :func:`email_guard.lists.classify_greylist` -- against the lists as they
+    stand now, from the subject and excerpt the candidate already carries. So
+    the console's answer cannot drift from the scanner's: a candidate survives
+    here exactly when the scanner would stage it again today.
+
+    What that rule means in practice, for the four ways a card leaves the queue
+    without anybody clicking anything:
+
+    * the sender is now on the whitelist or the blacklist -- decided;
+    * the message matches an *allowed* greylist structure -- catalogued, and it
+      would now clear;
+    * it matches a *denied* one -- catalogued, and it would now be rejected;
+    * only the genuinely unresolved remain: senders on no list, and greylisted
+      senders whose message matches no structure they have.
+
+    The excerpt is the same truncated ``clean_text`` the scanner matched on, so
+    a body phrase far into a long message can match at scan time and not here.
+    That errs towards showing a card, which is the safe direction: the worst
+    case is a review the reviewer did not strictly need.
+    """
+    document = candidate.document
+    sender = _section(document, "sender")
+    email = str(sender.get("email") or "").strip().lower()
+    domain = str(sender.get("domain") or "").strip().lower()
+    subject = _section(document, "evidence").get("subject")
+
+    greylist_classification, _, _ = classify_greylist(
+        lists.greylist, email, domain, subject if isinstance(subject, str) else "", body(document)
+    )
+    # The two fields `propose.classify` reads besides the greylist verdict. The
+    # scanner's `clean` stage sets them from the same `find_entry` rule.
+    message = {
+        "original_sender": email,
+        "whitelist_hit": find_entry(lists.whitelist, email, domain) is not None,
+        "blacklist_hit": find_entry(lists.blacklist, email, domain) is not None,
+    }
+    return wants_candidate(classify(message, greylist_classification))
 
 
 def resolve(daily_brief_dir: str | Path, candidate_id: str) -> Path | None:

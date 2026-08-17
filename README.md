@@ -1018,12 +1018,36 @@ section of `config/config.json` or the environment (`EMAIL_GUARD_WEBUI_HOST`,
 ### What Phase 1 does
 
 - **Review** — the queue read from `data/daily-brief/*/candidate.json`, one card per
-  unreviewed candidate: the sender, the flags, the message excerpt, and which list (if any)
-  already covers that sender. Choose a list, catalogue a structure if it is a greylist
-  decision, and Confirm — which applies **one** decision immediately, as its own
-  single-item decisions document, and moves the candidate into a `reviewed/` sibling so it
-  does not come back on reload. **Skip** is client-side only: it re-queues the card and tells
-  the server nothing, because "not yet" is not a decision.
+  candidate *that still needs an answer*: the sender, the flags, the message excerpt, and
+  which list (if any) already covers that sender. Choose a list, catalogue a structure if it
+  is a greylist decision, and Confirm — which applies **one** decision immediately, as its
+  own single-item decisions document, and moves the candidate into a `reviewed/` sibling so
+  it does not come back on reload. **Skip** is client-side only: it re-queues the card and
+  tells the server nothing, because "not yet" is not a decision.
+
+  **The queue is live against the current lists.** A candidate was staged against the lists
+  as they stood *then*, so every read of the queue re-asks the scanner's own question —
+  `propose.classify` over `lists.classify_greylist`, from the subject and excerpt the
+  candidate already carries — against the lists as they stand *now*, and suppresses whatever
+  is already answered: the sender is now white/blacklisted, or the message now matches a
+  known greylist structure, allowed **or** denied. What is left is only the genuinely
+  unresolved — unknown senders, and greylisted senders whose message matches no structure
+  they have. So listing a sender clears their pending cards without a second click, and a
+  greylisted subscription stops producing a card per message. The filter is
+  non-destructive: nothing moves on disk, and a card returns if the entry that covered it is
+  later removed. The response carries a `suppressed` count so a queue that shrank is
+  legible.
+
+- **Trust all mail from this sender** — the one-click answer to a sender whose *every*
+  message is wanted, sitting on the review card beside the list choice with an optional tags
+  field. It greylists the sender's domain with an `"ALL EMAILS"` catch-all — empty
+  `key_phrases`, disposition `allowed`, carrying those tags — which the matcher reads as
+  "every message from this sender". A subscription that puts a per-message reference in
+  every subject line is otherwise unanswerable by structure: each message is a new shape, so
+  it generates a card forever. With the catch-all written, future mail clears and carries the
+  tags, and the sender's other pending cards drop out of the queue by the rule above. A shape
+  already catalogued as `denied` on that domain **stays denied** — trusting a sender
+  wholesale does not un-block the one thing from them a reviewer rejected.
 - **List Data** — the live entries per list, greylist structures with their resolved
   dispositions, and a manual **Add** that builds a decision and applies it down the same
   path. There is no second way into `data/lists/`.
@@ -1086,6 +1110,22 @@ docker compose up -d                       # bridge + dispatcher + socket-proxy 
 ```
 
 `docker compose up -d webui` still brings up the console alone.
+
+**Deploying a console change.** The console's code — `webui/`, and the parts of the scanner
+package it imports in-process (`apply`, `lists`, `propose`, `config`) — is baked into the
+`webui` image, so a change to any of it needs that image rebuilt and the container
+recreated:
+
+```
+docker compose build webui
+docker compose up -d --force-recreate webui
+```
+
+The **scanner** image needs no rebuild for a console-only change, even one that touches
+`scanner/email_guard/apply.py`: the scanner never applies decisions — proposing and applying
+are separate halves of the loop on purpose — so its copy of the applier is inert. Rebuild
+the scanner (`docker compose --profile build build scanner`) when the *scanning* path
+changes, `propose.py` included, since that is the half the scanner does run.
 
 The console publishes to loopback only — `127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}`
 — and shares the same data volume the dispatcher and scanner use, so it reads the candidates
@@ -1246,24 +1286,31 @@ a live list changes.
 { "decisions_version": 1, "reviewed": "2026-05-15",
   "decisions": [
     { "candidate": "<job-or-domain>",
-      "action": "whitelist" | "greylist" | "blacklist" | "discard",
+      "action": "whitelist" | "greylist" | "trust_all" | "blacklist" | "discard",
       "entry":     { "email"|"domain", "friendly_name"?, "tags": [] },
       "structure": { "name", "key_phrases": [], "disposition": "allowed"|"denied", "tags": [] } }
   ] }
 ```
 
-- `entry` names the **subject** of the decision and is required for all three list actions
+- `entry` names the **subject** of the decision and is required for all four list actions
   — a greylist decision needs a target domain like any other. Exactly one of `email` or
   `domain`; a greylist `entry` must use `domain`.
 - `structure` is **greylist-only** and says what to catalogue, with its disposition. A
   greylist decision without one just creates the entry, whose shapes then all come back
   `new_structure` for review.
+- `trust_all` is the greylist action for a sender whose every message is wanted: it writes
+  the domain's entry with the `"ALL EMAILS"` catch-all structure — empty `key_phrases`,
+  disposition `allowed`, carrying the `entry`'s `tags` — and therefore carries **no
+  `structure` of its own**, which is refused rather than half-honoured. It keys on `domain`
+  like any greylist decision, and a `greylist` and a `trust_all` for one domain are not a
+  conflict: both name the greylist, and both apply to the one entry.
 - `discard` drops the candidate and touches nothing.
 
 This mirrors the wizard. A new domain: `action` picks the list; white/black writes a
 match-all entry (plus `tags` for the whitelist); greylist writes or appends the structure.
 A domain already on the greylist is just a greylist decision that appends another structure
-to the existing entry.
+to the existing entry — and `trust_all` is that same append with the shape already decided,
+which is why re-trusting a domain replaces its catch-all in place rather than duplicating it.
 
 #### The applier
 
@@ -1428,9 +1475,19 @@ email-guard/
 10. ~~Build the applier half of the learning loop~~ **Done** — `email_guard apply` consumes a
     decisions document and writes the live lists, with greylist dispositions and tags behind
     it. ~~The review UI that emits the decisions document~~ **Done (Phase 1)** — `webui/`
-    serves the review queue and the list panel over loopback. Still to do: the event store
-    behind the Event Log and the recognitions chart, the dispatcher config panel, and the
-    daily digest that presents the batch.
+    serves the review queue and the list panel over loopback. The queue is live against the
+    current lists, and **Trust all mail from this sender** answers the subscription case in
+    one click. Still to do: the event store behind the Event Log and the recognitions chart,
+    the dispatcher config panel, and the daily digest that presents the batch.
+
+    Also still to do, and deliberately not folded into the trust-all change: **generalising
+    structure *capture*.** Both halves of the capture path are over-specific — the scanner's
+    proposed structure is the whole subject line, and the console catalogues the phrase the
+    reviewer pastes — so a subject carrying a per-message reference produces a structure that
+    matches exactly one message. The catch-all covers the sender you want trusted wholesale;
+    it does nothing for the sender you want *structure-sorted*, where the fix is capturing
+    short stable phrases rather than paragraph-length ones. That is a fuzzier change (what
+    makes a phrase stable is a judgement about a corpus, not a rule) and belongs on its own.
 11. Wire up consolidated-inbox delivery for `cleared` mail.
 12. Seed the prompt-injection signature DB (Canary-assisted) as real traffic is seen.
 13. Fix the known issues; add a regression corpus of real sample messages.

@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from email_guard.apply import DECISIONS_VERSION
+from email_guard.apply import ACTION_TRUST_ALL, DECISIONS_VERSION
 
 # The fields a decision's `entry` may carry from the browser. `known_structures`
 # is deliberately absent: the applier fills a white/black entry with a match-all
@@ -59,6 +59,27 @@ def build_decision(
     if structure is not None:
         decision["structure"] = _prune(structure, STRUCTURE_FIELDS)
     return decision
+
+
+def build_trust_all(candidate: str, domain: str, tags: list[str] | None = None) -> dict[str, Any]:
+    """"Everything from this sender is fine", as one decision.
+
+    A ``trust_all`` decision carries a domain and the reviewer's tags, and
+    nothing else: the applier writes the ``"ALL EMAILS"`` catch-all structure
+    itself, so there is no shape for the browser to describe and no field here
+    for one to arrive in. That is the whole reason this is a builder rather than
+    a body posted straight through -- a one-click control must be exactly one
+    thing, and this is where "exactly one thing" is enforced.
+
+    The tags ride on the ``entry``; the applier copies them onto the catch-all
+    structure it writes, which is where the pipeline reads the labels it carries
+    through to a cleared verdict.
+    """
+    return build_decision(
+        candidate=candidate,
+        action=ACTION_TRUST_ALL,
+        entry={"domain": domain, "tags": tags or []},
+    )
 
 
 def _prune(source: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:

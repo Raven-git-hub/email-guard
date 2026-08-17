@@ -6,14 +6,15 @@ config wiring, which are Phase 2.
 
 Shape of the thing:
 
-    GET  /                      the console (static shell, no data in it)
-    GET  /static/...            app.css / app.js
-    GET  /api/candidates        the review queue
-    POST /api/decisions         one decision -> the applier -> the live lists
-    GET  /api/lists/{name}      entries for the List Data panel
-    POST /api/lists/{name}/add  a manual add, down the same applier path
-    GET  /api/rules/status      what rules pack is live, and when it landed
-    POST /api/rules/refresh     ask the rules updater to pull now
+    GET  /                        the console (static shell, no data in it)
+    GET  /static/...              app.css / app.js
+    GET  /api/candidates          the review queue, live against the lists
+    POST /api/decisions           one decision -> the applier -> the live lists
+    POST /api/decisions/trust-all trust every message from one sender's domain
+    GET  /api/lists/{name}        entries for the List Data panel
+    POST /api/lists/{name}/add    a manual add, down the same applier path
+    GET  /api/rules/status        what rules pack is live, and when it landed
+    POST /api/rules/refresh       ask the rules updater to pull now
 
 Three things are load-bearing rather than stylistic:
 
@@ -92,6 +93,23 @@ class DecisionBody(BaseModel):
     action: str
     entry: EntryBody | None = None
     structure: StructureBody | None = None
+
+
+class TrustAllBody(BaseModel):
+    """The one-click "trust everything from this sender" control.
+
+    Deliberately the narrowest body in the file: a candidate, the domain to
+    trust, and the reviewer's tags. No ``action`` -- the route is the action --
+    and no ``structure``, because the applier writes the catch-all itself. With
+    ``extra="forbid"`` there is no shape a browser could smuggle onto a
+    "trust everything" click.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate: str
+    domain: str
+    tags: list[str] = Field(default_factory=list)
 
 
 class AddBody(BaseModel):
@@ -224,19 +242,34 @@ def api_router() -> APIRouter:
 
     @router.get("/candidates")
     async def get_candidates(request: Request) -> dict[str, Any]:
-        """The unreviewed queue, oldest first.
+        """The unresolved queue, oldest first -- live against the current lists.
 
-        The lists are loaded once for the whole queue and every card's
-        membership computed against that snapshot, so a card cannot disagree
-        with the card above it about where a domain currently lives.
+        Every staged candidate is re-asked the scanner's own question against
+        the lists as they stand right now, and the ones already answered are
+        suppressed rather than shown (:func:`candidates.needs_review`). So a
+        card disappears the moment its sender is listed or its shape catalogued,
+        including cards staged long before that decision was made, and a
+        greylisted subscription stops generating one card per message.
+
+        ``suppressed`` is the count of staged candidates that dropped out, so a
+        queue that shrank after a decision is legible rather than mysterious.
+
+        The lists are loaded once for the whole queue -- for the filter and for
+        every card's membership -- so a card cannot disagree with the card above
+        it, or with the filter that let it through, about where a domain lives.
         """
         config = _config(request)
         lists = _lists(config)
-        cards = [
-            candidates_module.card(candidate, lists)
-            for candidate in candidates_module.queue(config.daily_brief_dir)
+        staged = candidates_module.queue(config.daily_brief_dir)
+        open_candidates = [
+            candidate for candidate in staged if candidates_module.needs_review(candidate, lists)
         ]
-        return {"candidates": cards, "count": len(cards)}
+        cards = [candidates_module.card(candidate, lists) for candidate in open_candidates]
+        return {
+            "candidates": cards,
+            "count": len(cards),
+            "suppressed": len(staged) - len(cards),
+        }
 
     @router.post("/decisions")
     async def post_decision(request: Request, body: DecisionBody) -> dict[str, Any]:
@@ -264,6 +297,40 @@ def api_router() -> APIRouter:
 
         return {
             "candidate": body.candidate,
+            "consumed": path is not None,
+            "report": report,
+        }
+
+    @router.post("/decisions/trust-all")
+    async def post_trust_all(request: Request, body: TrustAllBody) -> dict[str, Any]:
+        """Trust every message from this sender's domain, in one click.
+
+        The same applier, the same guarantees: the decision is built here rather
+        than accepted from the browser (:func:`decisions.build_trust_all`), so
+        this route can only ever write the ``"ALL EMAILS"`` catch-all onto one
+        greylist domain. Mutual exclusivity comes with it -- a domain trusted
+        this way leaves whichever list it was on.
+
+        Order matches ``/api/decisions``: apply first, consume second, so a
+        rejected decision leaves the card in the queue. And once it applies, the
+        sender's *other* pending cards need no decision either -- the queue
+        filter drops them on the next read, which is why this control clears a
+        backlog of subscription cards rather than the top one only.
+        """
+        config = _config(request)
+        decision = decisions_module.build_trust_all(
+            candidate=body.candidate, domain=body.domain, tags=body.tags
+        )
+        document = decisions_module.build_document(decision, today=request.app.state.today())
+        report = apply_decisions(document, config.lists_dir)
+
+        path = candidates_module.resolve(config.daily_brief_dir, body.candidate)
+        if path is not None:
+            candidates_module.mark_reviewed(path)
+
+        return {
+            "candidate": body.candidate,
+            "domain": body.domain,
             "consumed": path is not None,
             "report": report,
         }

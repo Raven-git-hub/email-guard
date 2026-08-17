@@ -295,6 +295,9 @@ function renderReview() {
   lower.appendChild(buildStructureBox());
   card.appendChild(lower);
 
+  // --- one click: trust everything from this sender
+  card.appendChild(buildTrustBox(current));
+
   // --- actions
   const actions = el('div', 'rev-actions');
   actions.appendChild(el('span', 'queue-count', state.queue.length + ' in queue'));
@@ -388,6 +391,83 @@ function buildStructureBox() {
   tagRow.appendChild(tags);
   box.appendChild(tagRow);
   return box;
+}
+
+/* "Trust all mail from this sender" — the subscription case, in one click.
+ *
+ * The rest of the card catalogues ONE shape; this catalogues the sender. It
+ * greylists the domain with an ALL EMAILS catch-all, which the engine reads as
+ * "match every message from here", so an invoice with a different reference in
+ * every subject stops generating a card per message. It sits outside the list
+ * choice on purpose: it is not a fourth list, and it needs neither a phrase nor
+ * a disposition — which is the whole point of it being one click.
+ *
+ * The domain is greylistTarget(), not the sending subdomain: same rule the
+ * greylist decision uses, so trusting a sender already covered by a listed
+ * parent domain writes the catch-all onto THAT entry. */
+function buildTrustBox(current) {
+  const domain = greylistTarget(current);
+
+  const box = el('div', 'trust-box');
+  box.appendChild(el('div', 'mini-lbl', 'Trust all mail from this sender'));
+  box.appendChild(el(
+    'div',
+    'trust-note',
+    domain
+      ? 'Greylists ' + domain + ' with an ALL EMAILS catch-all: every message from it '
+        + 'clears from now on, carrying the tags below — and its other cards leave the '
+        + 'queue. Any shape already blocked for this domain stays blocked.'
+      : 'This sender has no domain, so there is nothing to trust wholesale.',
+  ));
+
+  const row = el('div', 'trust-row');
+  const tags = document.createElement('input');
+  tags.className = 'form-entry';
+  tags.id = 'trustTags';
+  tags.placeholder = 'tags (optional)';
+  tags.disabled = !domain;
+  row.appendChild(tags);
+
+  const button = el('button', 'btn', 'Trust all mail from this sender');
+  button.id = 'trustAllBtn';
+  button.disabled = !domain;
+  button.addEventListener('click', () => { trustAllSender(); });
+  row.appendChild(button);
+
+  box.appendChild(row);
+  return box;
+}
+
+async function trustAllSender() {
+  const current = state.queue[0];
+  if (!current) return;
+  const domain = greylistTarget(current);
+  if (!domain) return;
+
+  const button = byId('trustAllBtn');
+  button.disabled = true;
+
+  try {
+    await postJSON('/api/decisions/trust-all', {
+      candidate: current.id,
+      domain: domain,
+      tags: parseTags(byId('trustTags').value),
+    });
+  } catch (err) {
+    // Same contract as Confirm: the applier is all-or-nothing, so a rejected
+    // decision changed nothing and the card stays where it is.
+    showReviewError(err.message);
+    button.disabled = false;
+    return;
+  }
+
+  state.queue.shift();
+  toast('→ trusting all mail from ' + domain);
+  renderReview();
+  // The re-read is doing more work here than after a Confirm: every other card
+  // from this domain is now answered too, and the queue drops them.
+  await Promise.all([loadQueue().catch(() => {}), refreshList().catch(() => {})]);
+  renderReview();
 }
 
 function pickList(button) {
