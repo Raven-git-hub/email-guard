@@ -22,6 +22,7 @@ import signal
 import sys
 import threading
 
+from . import store
 from .config import ConfigError, load
 from .control import build_server, serve_in_background
 from .loop import run_forever
@@ -96,6 +97,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         run_forever(config, stop)
+    except store.LiveRootNotWritable as exc:
+        # The one failure that is neither transient nor fixable from in here:
+        # the operator has to chown the bind directory on the host. Say that in
+        # a single line and exit -- a PermissionError traceback repeated by
+        # `restart: unless-stopped` buries the sentence that names the fix.
+        log.error("rules updater cannot start: %s", exc)
+        return EXIT_ERROR
     finally:
         if server is not None:
             server.shutdown()

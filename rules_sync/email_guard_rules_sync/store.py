@@ -52,6 +52,46 @@ PRUNE_MIN_AGE_SECONDS = 3600.0
 _IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "*.pyo")
 
 
+class LiveRootNotWritable(RuntimeError):
+    """The live rules root exists but this uid cannot write into it.
+
+    Its own class because it is an *operator* problem with exactly one fix, and
+    the fix is not in the container. Docker creates a missing bind source
+    root-owned on the first `up`, and the service runs as uid 1000, so the very
+    first mkdir fails -- which, unhandled, is a PermissionError traceback on
+    every restart of a `restart: unless-stopped` service. One sentence naming
+    the uid and the chown is worth more than the stack.
+    """
+
+
+def not_writable_error(live_dir: Path, exc: OSError) -> LiveRootNotWritable:
+    """The one line an operator needs: which uid, which path, which command."""
+    return LiveRootNotWritable(
+        f"{live_dir} is not writable by uid {os.getuid()}:{os.getgid()} "
+        f"({exc.strerror}). Docker creates a missing bind source root-owned; chown "
+        "it on the host to EMAIL_GUARD_UID:EMAIL_GUARD_GID -- "
+        'sudo chown -R "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}" rules-live'
+    )
+
+
+def as_not_writable(live_dir: Path, exc: BaseException) -> LiveRootNotWritable | None:
+    """Recognise "the live root is root-owned" in an arbitrary failure.
+
+    The live root is written from several places -- the lock file, the git
+    working copy, a staged release, ``state.json`` -- so the permission failure
+    surfaces wherever the pull happens to reach first. Callers use this to answer
+    "is this that?" once, rather than guarding each write.
+
+    The ``os.access`` re-check is what keeps this honest: a PermissionError from
+    somewhere else entirely stays an unrecognised failure, traceback and all.
+    """
+    if isinstance(exc, LiveRootNotWritable):
+        return exc
+    if isinstance(exc, PermissionError) and not os.access(live_dir, os.W_OK):
+        return not_writable_error(Path(live_dir), exc)
+    return None
+
+
 def release_dir(live_dir: Path, release_id: str) -> Path:
     return Path(live_dir) / "releases" / release_id
 
@@ -142,9 +182,16 @@ def ensure_live_root(live_dir: Path, seed_dir: Path | None = None) -> None:
 
     Called on every start and before every pull, so a live root that was wiped,
     or never existed, repairs itself rather than failing the first pull.
+
+    Raises :class:`LiveRootNotWritable` if the root cannot be written. This is
+    the first write the updater ever attempts, so it is where a root-owned bind
+    directory surfaces -- as one actionable line, not a traceback.
     """
     live = Path(live_dir)
-    (live / "releases").mkdir(parents=True, exist_ok=True)
+    try:
+        (live / "releases").mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise not_writable_error(live, exc) from exc
 
     prune_incomplete(live)
 

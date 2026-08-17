@@ -264,26 +264,110 @@ def test_the_updater_image_has_no_docker_cli():
     assert "COPY --from=dockercli" not in dockerfile
 
 
+def _declared_roots() -> list[str]:
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r"where\s*=\s*\[([^\]]+)\]", pyproject)
+    assert match, "could not find packages.find `where` in pyproject.toml"
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def _copies(dockerfile: str, root: str) -> bool:
+    return bool(re.search(rf"^COPY\s+{re.escape(root)}/", dockerfile, re.MULTILINE))
+
+
+def _stubs(dockerfile: str, root: str) -> bool:
+    return bool(
+        re.search(rf"^RUN mkdir -p .*\b{re.escape(root)}\b", dockerfile, re.MULTILINE)
+    )
+
+
 def test_every_image_creates_every_declared_package_root():
-    """A fourth `packages.find` root breaks `pip install .` in the other images.
+    """A fifth `packages.find` root breaks `pip install .` in the other images.
 
     Each Dockerfile must COPY or `mkdir -p` all four, or the install fails on
     the missing ones. Asserted so the next root added cannot repeat it.
     """
-    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r"where\s*=\s*\[([^\]]+)\]", pyproject)
-    assert match, "could not find packages.find `where` in pyproject.toml"
-    roots = re.findall(r'"([^"]+)"', match.group(1))
+    roots = _declared_roots()
     assert set(roots) == {"scanner", "dispatcher", "webui", "rules_sync"}
 
     for image in ("scanner", "dispatcher", "webui", "rules_sync"):
         dockerfile = (PROJECT_ROOT / image / "Dockerfile").read_text(encoding="utf-8")
         for root in roots:
-            provided = (
-                re.search(rf"^COPY\s+{re.escape(root)}/", dockerfile, re.MULTILINE)
-                or re.search(rf"^RUN mkdir -p .*\b{re.escape(root)}\b", dockerfile, re.MULTILINE)
-            )
+            provided = _copies(dockerfile, root) or _stubs(dockerfile, root)
             assert provided, f"{image}/Dockerfile neither COPYs nor mkdirs {root!r}"
+
+
+def test_each_image_carries_the_code_it_runs_and_stubs_the_rest():
+    """Which roots are REAL in each image, not merely present.
+
+    An empty stub satisfies `pip install .` and installs nothing, so "the root
+    exists" says nothing about whether that package is importable at runtime.
+    The updater is the case that matters: it stubbed `scanner/`, which made
+    `email_guard` absent, which made the pack's own validator report every
+    `func` rule as "failed to import" and reject every pull. See
+    ``tests/test_rules_sync_validation_env.py`` for the behaviour itself.
+    """
+    real = {
+        # image     -> the roots it genuinely installs
+        "scanner": {"scanner"},
+        "dispatcher": {"dispatcher", "scanner"},
+        "webui": {"webui", "scanner", "dispatcher"},
+        # rules_sync's OWN code imports nothing from the engine. `scanner` is
+        # here for the validation SUBPROCESS, which loads the pulled pack's
+        # `scan/*_funcs.py`, and those import `email_guard.links`.
+        "rules_sync": {"rules_sync", "scanner"},
+    }
+    roots = set(_declared_roots())
+
+    for image, installed in real.items():
+        dockerfile = (PROJECT_ROOT / image / "Dockerfile").read_text(encoding="utf-8")
+        for root in installed:
+            assert _copies(dockerfile, root), (
+                f"{image}/Dockerfile must COPY {root}/ -- an empty stub installs "
+                "no code, and this image needs that package importable"
+            )
+        for root in roots - installed:
+            assert _stubs(dockerfile, root) and not _copies(dockerfile, root), (
+                f"{image}/Dockerfile should stub {root!r}, not copy it"
+            )
+
+
+def test_the_updater_installs_the_engine_rather_than_stubbing_it():
+    """The regression, stated as the one line of Dockerfile it lives in.
+
+    `rules/scan/level*_funcs.py` import `email_guard.links`, and `validate.py`
+    proves a pack will run by exec'ing those modules. With `scanner/` stubbed,
+    every pull was rejected with 11 "failed to import" errors and the updater
+    fell back to the seed forever.
+    """
+    dockerfile = (PROJECT_ROOT / "rules_sync" / "Dockerfile").read_text(encoding="utf-8")
+
+    assert _copies(dockerfile, "scanner")
+    assert not _stubs(dockerfile, "scanner")
+    # And the engine stays dependency-free, so this costs no third-party code.
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r"^dependencies = \[\]$", pyproject, re.MULTILINE), (
+        "the updater image installs the engine on the strength of it having no "
+        "runtime dependencies; that is no longer true"
+    )
+
+
+def test_the_updater_still_imports_nothing_from_the_engine_itself():
+    """Installing the engine is for the SUBPROCESS, not for this package.
+
+    `rules_sync` reaching into `email_guard` directly would couple the updater
+    to the engine's API, and the pack (and its updater) are meant to stay
+    independently movable to another repository.
+    """
+    package = PROJECT_ROOT / "rules_sync" / "email_guard_rules_sync"
+    offenders = [
+        f"{path.name}:{number}: {line.strip()}"
+        for path in sorted(package.glob("*.py"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if re.match(r"^\s*(from|import)\s+email_guard(\.|\s|$)", line)
+    ]
+
+    assert offenders == [], f"rules_sync imports the engine: {offenders}"
 
 
 # --- repository hygiene ----------------------------------------------------------------

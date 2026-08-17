@@ -85,6 +85,18 @@ def pull_and_promote(config: SyncConfig | None = None) -> PullResult:
             message=str(exc),
         )
     except Exception as exc:  # the loop must not die, and a handler must answer
+        # A root-owned live root is an operator problem with one known fix, so
+        # it is reported as that sentence rather than as a stack trace nobody
+        # can act on. Everything else keeps the traceback -- it is unrecognised.
+        not_writable = store.as_not_writable(cfg.live_dir, exc)
+        if not_writable is not None:
+            log.error("rules pull failed: %s", not_writable)
+            return PullResult(
+                status=STATUS_ERROR,
+                old_commit=store.current_release(cfg.live_dir),
+                timestamp=_now(),
+                message=str(not_writable),
+            )
         log.exception("rules pull failed")
         return PullResult(
             status=STATUS_ERROR,

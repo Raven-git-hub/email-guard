@@ -88,6 +88,16 @@ VALIDATION.md, "The rules auto-updater, and cutting over to it".
 > it as a subprocess. That is isolation and repeatability, **not a sandbox** — the real
 > controls are the container's: non-root, read-only rootfs, all capabilities dropped, no
 > docker, no lists. It does have egress, which is the honest residual risk.
+>
+> Because it imports the pack, **the updater image carries the engine too**. The pack's
+> rule functions call into `email_guard` (link alignment, registrable domains), so
+> validating a pack means importing it in an environment where the engine is present —
+> the *scanner's* environment, not the updater's. Without it the validator reports every
+> function rule as "failed to import" and the updater rejects packs that scan mail
+> perfectly well. It costs nothing: the engine has zero runtime dependencies. The
+> updater's own code still imports nothing from it, so the pack and its updater stay
+> independently movable to another repository — and the two images must be built from the
+> same checkout, so the engine a pack is validated against is the one that will run it.
 
 ---
 

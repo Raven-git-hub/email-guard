@@ -34,13 +34,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 
 WORKDIR /app
 
-# The updater imports nothing from the scanner, the dispatcher or the console --
-# it reaches the pack only by running the pack's own `validate.py` as a
-# subprocess. But all four package roots are declared in pyproject's
-# `packages.find`, so the other three must exist for `pip install .` to resolve.
+# The updater's OWN code imports nothing from the scanner, the dispatcher or the
+# console -- it reaches the pack only by running the pack's own `validate.py` as
+# a subprocess. The scanner is nonetheless installed, for the subprocess's sake:
+#
+#   `validate.py` proves a pack will RUN by `exec_module`-ing its
+#   `scan/*_funcs.py`, and those funcs call into the engine
+#   (`from email_guard.links import ...`). Without `email_guard` importable, the
+#   validator reports every func rule as "failed to import" and the updater
+#   rejects every pull -- including packs that scan mail perfectly well. The
+#   validation environment must therefore match the SCANNER's, not the updater's.
+#
+# It costs nothing: the engine declares zero runtime dependencies
+# (pyproject.toml), so this adds no third-party packages and no new surface.
+#
+# IMPORTANT: build this image and the scanner image from the SAME checkout. The
+# engine baked in here is the one a pulled pack is validated against, and it has
+# to be the engine the scanner will then run that pack on -- validating against a
+# newer or older `email_guard` would accept a pack the scanner cannot load, or
+# refuse one it could.
+#
+# The dispatcher and the console stay out: nothing the pack imports lives there.
+# All four `packages.find` roots must still exist for `pip install .` to resolve,
+# so those two are created empty.
 COPY pyproject.toml ./
 COPY rules_sync/ ./rules_sync/
-RUN mkdir -p scanner dispatcher webui
+COPY scanner/ ./scanner/
+RUN mkdir -p dispatcher webui
 
 RUN pip install --no-cache-dir . \
  && rm -rf /root/.cache

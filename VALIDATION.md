@@ -378,6 +378,30 @@ It comes up with the stack and starts working immediately, but **it changes
 nothing that scans until you cut the mounts over** — that is step 9.4, and it is
 a deploy-time change, not something the code does for you.
 
+### 9.0 Before the first `up`: own the live tree
+
+`rules-live/` is the updater's only writable path, and it is a bind mount. **If
+the directory is missing when the stack starts, docker creates it root-owned** —
+and the updater runs as `EMAIL_GUARD_UID:EMAIL_GUARD_GID`, so it cannot write a
+single byte into it. The repository ships `rules-live/.gitkeep` so a fresh clone
+already owns the directory; a deploy that copied the tree without dotfiles, or
+created the path by hand as root, will not:
+
+```sh
+ls -ld rules-live
+mkdir -p rules-live
+sudo chown -R "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}" rules-live
+```
+
+The symptom if you skip it is one line in `docker compose logs rules-updater`,
+and the service exiting rather than looping on it:
+
+```
+rules updater cannot start: /app/rules-live is not writable by uid 1000:1000
+(Permission denied). Docker creates a missing bind source root-owned; chown it
+on the host to EMAIL_GUARD_UID:EMAIL_GUARD_GID — sudo chown -R …
+```
+
 ### 9.1 Confirm it seeded itself
 
 **The live tree serves the committed pack before any pull has succeeded.** On
@@ -436,6 +460,27 @@ refused pack is the updater working, not a broken button:
 Running it a second time immediately must return `no_change`. If it returns
 `updated` twice for the same upstream commit, the promote is not idempotent and
 something is wrong.
+
+> **A `rejected` commit is remembered, and the next pull does not re-check it.**
+> The refusal is recorded in `rules-live/state.json` as `last_rejected_commit`,
+> and a later pull that finds upstream still on that commit replays the stored
+> errors without refetching or re-validating — deliberately, so a stuck feed
+> keeps saying so instead of quietly costing a fetch every interval.
+>
+> The consequence is that **fixing the problem is not enough to clear it** if the
+> problem was in the updater rather than in the pack — a rebuilt image still
+> short-circuits on the remembered verdict, and the upstream commit has not
+> changed to dislodge it. Forget the verdict, then pull again:
+>
+> ```sh
+> docker compose stop rules-updater
+> sudo rm -rf rules-live/state.json rules-live/releases rules-live/current
+> docker compose up -d rules-updater      # re-seeds, then re-evaluates the commit
+> ```
+>
+> Removing `state.json` alone is enough to force a re-evaluation; the rest is
+> only there to leave a clean tree. `rules-live/work/` may be kept — it is just
+> a git working copy and re-cloning it costs a fetch.
 
 ### 9.3 Prove a bad pack cannot go live
 
@@ -749,10 +794,60 @@ unauthenticated client, and GitHub returns "not found" for both.
 An `ssh://` or `git@host:path` URL is refused at startup rather than attempted,
 with a message saying so on stderr.
 
+### Every pull is `rejected`, and the pack is fine
+
+**Symptom.** Every pull — scheduled or from the console's **Refresh rules** —
+comes back `rejected`, with `validation_errors` that all look like this:
+
+```
+scan/level2.json[content-links]: scan/level2_funcs.py failed to import
+  (No module named 'email_guard')
+```
+
+The live pack never moves off `releases/seed/rules`, and
+`python rules/validate.py rules/` on the host says `rules pack OK`.
+
+**That disagreement is the diagnosis.** The pack is valid; the *environment the
+updater validates it in* is not. `rules/scan/level*_funcs.py` call into the
+engine (`from email_guard.links import …`), and `validate.py` proves a pack will
+run by importing exactly those modules — so validation needs `email_guard`
+importable, and the updater image has to install `scanner/` for that. Confirm
+what the running image actually has:
+
+```sh
+docker compose exec rules-updater python -c "import email_guard; print(email_guard.__file__)"
+```
+
+A `ModuleNotFoundError` here is the fault. Rebuild the updater **from the same
+checkout as the scanner** — the engine it validates against must be the engine
+the scanner will run the pack on:
+
+```sh
+docker compose build rules-updater scanner
+docker compose up -d rules-updater
+```
+
+Then clear the remembered verdict, or the rebuilt image will short-circuit on it
+and report the same errors without re-validating anything — see the note under
+§9.2:
+
+```sh
+docker compose stop rules-updater
+sudo rm -rf rules-live/state.json rules-live/releases rules-live/current
+docker compose up -d rules-updater
+```
+
 ### The updater cannot write, or the dispatcher will not start on the rules mount
 
-**Symptom.** `Permission denied` under `rules-live/` in the updater's logs, or
-the dispatcher exits with `container.rules_dir (…) does not exist inside the
+**Symptom.** The updater logs a single line and exits:
+
+```
+rules updater cannot start: /app/rules-live is not writable by uid 1000:1000
+(Permission denied). Docker creates a missing bind source root-owned; chown it
+on the host to EMAIL_GUARD_UID:EMAIL_GUARD_GID — sudo chown -R …
+```
+
+Or the dispatcher exits with `container.rules_dir (…) does not exist inside the
 dispatcher`.
 
 The usual cause is an absent `rules-live/` on the host: docker creates a missing
@@ -761,10 +856,15 @@ write into. The repository ships `rules-live/.gitkeep` so a fresh clone owns the
 directory; if it went missing:
 
 ```sh
+ls -ld rules-live
 mkdir -p rules-live && touch rules-live/.gitkeep
 sudo chown -R "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}" rules-live
 docker compose up -d rules-updater
 ```
+
+The service exits rather than retrying on purpose: nothing inside the container
+can fix an ownership problem on the host, and a loop would only bury the line
+that names the fix.
 
 ### Orphaned containers after a hard kill
 

@@ -9,6 +9,10 @@ The loop must not die. A pull that fails is logged and retried later with a
 backoff -- an updater that exits on the first DNS blip is an updater that
 silently stops updating, which is the failure mode this whole component exists
 to prevent.
+
+The single exception is a live root this process cannot write, which is not a
+blip but a host-side ownership mistake: there is nothing to retry until an
+operator chowns it, so it is reported once, by name, and the process exits.
 """
 
 from __future__ import annotations
@@ -46,6 +50,11 @@ def run_forever(
     # Seed first, and unconditionally -- including when the interval is off. A
     # live root that has never been promoted into must still serve the committed
     # pack, or repointing the mounts at it would break scanning.
+    #
+    # This is also the one failure allowed out of this function:
+    # `store.LiveRootNotWritable` means the live root is not ours to write and
+    # no number of retries will change that. `__main__` turns it into a single
+    # line naming the chown; see the module docstring's "must not die".
     store.ensure_live_root(config.live_dir, config.seed_dir)
 
     if config.interval_seconds is None:
