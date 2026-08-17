@@ -1,0 +1,7 @@
+{
+  "expected_bucket": "cleared",
+  "expected_level": 4,
+  "reviewed": true,
+  "synthetic": true,
+  "note": "KNOWN FAILURE -- the zero-width bug. Identical to greylist-receipt-cleared except that the body carries bare U+200B / U+FEFF padding. triage.injection_markers() raises 'hidden_unicode' on any zero-width character at all, which is a level-1 reject, so a catalogued receipt from a greylisted sender is thrown out for whitespace that mail templating emits routinely. Zero-width characters are evidence of concealment only when they are concealing something; on their own they are a formatting artefact. Held as an xfail in tests/test_eval_corpus.py; the fix flips it to a passing guard."
+}

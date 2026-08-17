@@ -49,6 +49,29 @@ The rules pack contains:
 > Replaces the prototype's pattern of storing logic as JavaScript strings run through
 > `new Function()`, where a stray syntax error broke a scan at runtime with no warning.
 
+**Validation proves a pack loads. The harness proves it classifies.** Those are
+different questions, and the validator above only answers the first: a rule that parses
+perfectly, compiles its regexes and quarantines every bank in the country is a valid
+pack. So there is a second gate, `python -m email_guard.eval <corpus>` — a labelled
+corpus of messages and a scorer that runs each one through the *real* classification
+entry point and compares the bucket it lands in to the bucket a human said it should.
+
+Grading is by bucket, and the direction of a failure decides the exit code: mail that
+should have been held back but reached `cleared` is **dangerous** and fails the run;
+over-blocking is **advisory** and does not, because tightening a rule always costs a few
+over-blocks before it is tuned and a gate that fires on that is one people route around.
+`--baseline` diffs against a previous run, so "what did my change fix, and what did it
+break" is one command.
+
+Two corpora, because a corpus is a pile of whole messages: `tests/eval-corpus/` is
+committed and **synthetic-only** (invented senders, reserved `.example` domains) and runs
+in the normal test suite; the operator's real mail lives in a gitignored corpus under
+`data/`, imported from the scanner's own outbound store and reviewed by hand. The split
+is enforced, not documented — the harness refuses a real corpus git would commit, refuses
+real cases inside the synthetic one, and the test suite fails the build if any `.eml` is
+tracked outside the sanctioned synthetic directories. The rule-tuning loop is
+`VALIDATION.md` §10.
+
 ### Auto-updating the pack
 
 The `rules-updater` service pulls the pack from git on an interval (24h by default),
@@ -110,6 +133,7 @@ VALIDATION.md, "The rules auto-updater, and cutting over to it".
 | Triage / initial level assignment | Exists; greylist matching to be updated to current schema |
 | Signature reference DB (`rules/reference/`) | **Scaffolded** — injection feed seeded, phishing feed empty by design; static loader that fails open |
 | Rules pack auto-updater (`rules_sync/`) | **Built, unvalidated on a host** — scheduled `git pull` plus a manual refresh from the console, validated and promoted atomically by symlink swap. Repointing the scanner's mounts at the managed tree is a deploy-time change — see `VALIDATION.md` §9 |
+| Rule evaluation harness (`email_guard.eval`) | **Built** — labelled corpus + scorer over the real classification path; gates on dangerous false-clears, `--baseline` diffs a change. Committed synthetic corpus runs in the test suite; the operator's real corpus is local and gitignored — see `VALIDATION.md` §10. Only as good as the labels a human has reviewed |
 | Dispatcher (bridge IMAP → scanner) | **Built** — on-arrival via IMAP `IDLE`, with the poll loop kept as the correctness backstop. Two scanner runners behind one interface: subprocess (dev) and one hardened container per message (deployed). Plus `--rescan`, the one-shot onboarding pass over an entire existing mailbox |
 | Per-message scanner container | **Built, unvalidated on a host** — `scanner/Dockerfile` plus `ContainerRunner`: `docker run --rm`, no network, read-only root, non-root, caps dropped, memory/pid/cpu bounded, Docker reached via a socket-proxy. Built where no Docker daemon exists, so the container path has never actually run — see `VALIDATION.md` |
 | Canary (local LLM) semantic checks | **To be built** |

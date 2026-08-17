@@ -1,0 +1,7 @@
+{
+  "expected_bucket": "cleared",
+  "expected_level": 4,
+  "reviewed": true,
+  "synthetic": true,
+  "note": "The ordinary good case, and the one that proves the harness reflects reality rather than only catching attacks. quietservice.example is greylisted and this subject matches the catalogued 'Quiet Service Receipt' structure, so triage opens at level 4 and the level-4 deep dive confirms it: aligned links, DKIM pass, a recognised sender. If a rule change starts quarantining this, legitimate service mail is being over-blocked."
+}

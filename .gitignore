@@ -16,6 +16,19 @@ data/outbound/**
 data/dispatcher/**
 !data/dispatcher/.gitkeep
 
+# The operator's REAL evaluation corpus: whole messages imported from the
+# outbound store, plus the frozen list context they were labelled against. This
+# is the most concentrated pile of personal data in the repository -- one
+# directory holding every message the scanner has ever seen -- and it exists
+# only so rule changes can be measured before they ship. It is never committed.
+#
+# The committed corpus is the SYNTHETIC one at tests/eval-corpus/, and the split
+# is enforced rather than trusted: `email_guard.eval.privacy` refuses to grade a
+# real corpus git is not ignoring, and tests/test_eval_privacy.py fails the
+# build if any .eml is tracked outside the synthetic directories.
+data/eval-corpus/**
+!data/eval-corpus/.gitkeep
+
 # --- Rules pack auto-updater: pulled releases and its git working copy ---
 #
 # Derived state, not source. `rules/` is the committed pack and the seed; every

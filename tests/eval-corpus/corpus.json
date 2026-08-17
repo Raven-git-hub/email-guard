@@ -1,0 +1,4 @@
+{
+  "synthetic_only": true,
+  "note": "SYNTHETIC-ONLY. Every message here is hand-made: invented senders on reserved .example domains, no real correspondent, no personal content. This corpus is committed and runs in the normal pytest suite, so it guards these behaviours for every user of the shared rules pack. The operator's real mail belongs in a corpus under the gitignored data tree (data/eval-corpus/), never here -- the harness refuses to grade a case marked \"synthetic\": false inside a synthetic-only corpus, and tests/test_eval_privacy.py fails the build if any .eml is tracked outside the sanctioned synthetic directories."
+}

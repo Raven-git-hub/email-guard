@@ -1,0 +1,16 @@
+{
+  "_note": "SYNTHETIC list context, frozen into this corpus. Seeded from data/lists/whitelist.sample.json shapes; invented contacts only. Frozen rather than read from the live lists because identity decides the bucket as much as the rules do -- a case labelled 'cleared' because its sender was greylisted stops meaning anything the moment that entry is edited.",
+  "whitelist": [
+    {
+      "email": "colleague@trusted-partner.example",
+      "friendly_name": "Trusted Partner",
+      "tags": ["work"],
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

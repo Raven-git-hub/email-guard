@@ -1,0 +1,20 @@
+{
+  "_note": "SYNTHETIC list context, frozen into this corpus. Seeded from data/lists/greylist.sample.json shapes; reserved .example domains only.",
+  "greylist": [
+    {
+      "domain": "quietservice.example",
+      "tags": ["receipts", "finance"],
+      "known_structures": [
+        {
+          "name": "Quiet Service Receipt",
+          "key_phrases": [
+            "Subject: Your receipt",
+            "thank you for your order"
+          ],
+          "disposition": "allowed",
+          "tags": ["receipt"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "_note": "SYNTHETIC list context, frozen into this corpus. Invented senders only.",
+  "blacklist": [
+    {
+      "email": "offers@known-spammer.example",
+      "friendly_name": "Known Spammer",
+      "known_structures": [
+        {
+          "name": "ALL EMAILS",
+          "key_phrases": []
+        }
+      ]
+    }
+  ]
+}

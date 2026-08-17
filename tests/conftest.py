@@ -53,6 +53,10 @@ OUTPUT_DIRS = (
     PROJECT_ROOT / "data" / "daily-brief",
     PROJECT_ROOT / "data" / "dispatcher",
     PROJECT_ROOT / "data" / "lists",
+    # The operator's REAL evaluation corpus. An eval test that forgot its
+    # tmp_path would otherwise import whole messages into it, or overwrite
+    # labels a human spent an evening reviewing.
+    PROJECT_ROOT / "data" / "eval-corpus",
 )
 
 # --- injection corpora, shared by the feed tests and the hard-baked floor -----

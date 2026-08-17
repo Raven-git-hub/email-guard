@@ -585,6 +585,171 @@ containers, so it has no docker access at all.
 
 ---
 
+## 10. The rule-tuning loop
+
+§9 proves a pulled pack **loads**. Nothing in it proves the pack **classifies**
+correctly — a rule that parses perfectly and quarantines every bank in the
+country passes validation with no complaint. This section is the other half:
+label a corpus of your own mail, score the pack against it, and only push when
+nothing dangerous gets through.
+
+```
+   import ──▶ review ──▶ run ──▶ read ──▶ push ──▶ (§9 promotes it)
+              ▲                    │
+              └────── fix a rule ──┘
+```
+
+The harness is a dev/ops tool. It is not in any image, the scanner does not
+import it, and it adds no dependency — it classifies by calling the same
+`scan_parsed` the live scanner calls.
+
+> **Privacy first.** A corpus is a directory of whole messages from real people.
+> The operator's corpus lives at `data/eval-corpus/`, which is gitignored, and
+> the harness *refuses to run* a corpus of real mail that git is not ignoring.
+> The committed corpus at `tests/eval-corpus/` is synthetic-only — invented
+> senders on reserved `.example` domains — and the harness refuses to import
+> real mail into it. `tests/test_eval_privacy.py` fails the build if any `.eml`
+> is tracked outside those synthetic directories.
+
+### 10.1 Import what the scanner has already stored
+
+Every scan writes `data/outbound/<bucket>/<job>/message.eml`, so the raw
+material has been accumulating since the first message. Copy it into corpus
+shape:
+
+```sh
+python -m email_guard.eval --import-from-outbound data/outbound data/eval-corpus
+```
+
+This copies each message verbatim, pre-fills `expected_bucket` with the bucket
+it landed in, marks every case `"reviewed": false`, and freezes a copy of your
+current lists into `data/eval-corpus/lists/` (once — the frozen context is half
+of what a label means, so a later import never re-points old cases at edited
+lists).
+
+Re-running it is safe: cases already in the corpus are left untouched, so a week
+of reviewing is not reset by the next import.
+
+### 10.2 Review and label — the step that does the work
+
+**The imported bucket is a guess, not an answer.** The reason you are building
+this is that the scanner mis-scores real mail; grading it against its own past
+output would score it as perfect and freeze today's mistakes in as the answer
+key. Unreviewed cases are *not graded*, and the harness says how many are
+waiting.
+
+For each case, open `data/eval-corpus/cases/<id>/` and read `message.eml`, then
+edit `expected.json`:
+
+```json
+{
+  "expected_bucket": "cleared",
+  "expected_level": 4,
+  "reviewed": true,
+  "synthetic": false,
+  "note": "routine statement notice from my bank; must not be quarantined"
+}
+```
+
+* `expected_bucket` — `cleared`, `flagged` or `rejected`. **What should have
+  happened**, which is often not what did.
+* `expected_level` — optional. Worth setting when the bucket is too coarse:
+  levels 4 and 5 both mean `cleared`.
+* `note` — why. In six months this is the only record of the judgement.
+* `reviewed: true` — the assertion that a human decided. Until it is set, the
+  case is skipped.
+
+Start with the mail that annoyed you. A dozen well-chosen cases beat two hundred
+unreviewed ones.
+
+### 10.3 Run the harness
+
+```sh
+python -m email_guard.eval data/eval-corpus
+python -m email_guard.eval data/eval-corpus --json before.json    # keep a baseline
+```
+
+### 10.4 Read the scorecard
+
+```
+graded 42  |  passed 38  failed 4  (dangerous 1, advisory 3)
+
+confusion matrix
+  expected \ actual      cleared   flagged  rejected
+  cleared                     21         2         1
+  flagged                      1        11         0
+  rejected                     0         0         6
+
+FAILURES
+
+  [DANGEROUS] rejected-a1b2-phisher.example
+      expected rejected, got cleared
+      levels:   initial 3 -> final 4
+      decided:  deep-scan (level 3 -> 4), greylist (known)
+      because:  triage: initial level 3 (greylist_new_structure) || pass1-level3: ...
+```
+
+Read it in this order:
+
+1. **Dangerous count.** Anything above zero means mail the corpus says should
+   have been held back reached `cleared`. Fix it before pushing.
+2. **The confusion matrix.** The shape of the mistakes. Weight down the
+   `cleared` column is over-blocking; weight in the `cleared` column on a
+   `flagged`/`rejected` row is the dangerous kind.
+3. **Each failure.** The `decided:` line says which half of the pipeline settled
+   it and which list was involved, and `because:` is the engine's own forensic
+   log — usually enough to name the rule without opening the message.
+
+**Exit codes**, which is what makes this usable from a hook or CI:
+
+| Code | Meaning |
+|---|---|
+| `0` | No dangerous false-clears. Advisory failures may be present, printed in full. |
+| `1` | At least one **dangerous** false-clear. Do not push. |
+| `2` | The run could not happen — bad corpus, invalid pack, real corpus in a committable location. |
+
+Over-blocking does not fail the run, deliberately. Tightening a rule nearly
+always costs a few over-blocks before it is tuned, and a gate that fires on that
+is a gate people learn to bypass. Letting bad mail into `cleared` is the failure
+worth blocking a push over.
+
+### 10.5 Change a rule, and see exactly what moved
+
+```sh
+# edit rules/scan/level3.json, rules/assess/level3.py, ...
+python -m email_guard.eval data/eval-corpus --baseline before.json
+```
+
+```
+FIXED (2):
+  + cleared-c3d4-mybank.example
+  + cleared-e5f6-invoices.example
+NEWLY BROKEN (1):
+  - rejected-g7h8-phisher.example
+
+  !! 1 case(s) became DANGEROUS false-clears: rejected-g7h8-phisher.example
+```
+
+That is the question the harness exists to answer, in one command. A deleted
+case is reported as `removed`, never as `fixed` — deleting the failing case and
+fixing it must not look the same.
+
+### 10.6 Only then push
+
+```sh
+python -m email_guard.eval data/eval-corpus && \
+python -m pytest tests/test_eval_corpus.py && \
+git push
+```
+
+The first command is your mail; the second is the committed synthetic corpus,
+which guards the shared behaviours for everyone. Once pushed, §9 takes over: the
+updater pulls the commit, validates that it loads, and promotes it.
+
+Two gates, and they check different things. Neither replaces the other.
+
+---
+
 ## Diagnosis
 
 ### The socket-proxy allow-list is too short
