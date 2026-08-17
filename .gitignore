@@ -16,6 +16,20 @@ data/outbound/**
 data/dispatcher/**
 !data/dispatcher/.gitkeep
 
+# --- Rules pack auto-updater: pulled releases and its git working copy ---
+#
+# Derived state, not source. `rules/` is the committed pack and the seed; every
+# release under here is a copy of some upstream commit of it, and `work/` is a
+# sparse clone with its own `.git`. Committing any of it would put a second,
+# diverging copy of the rules pack in the history.
+#
+# The directory itself is kept, like the data/ ones above: the dispatcher's
+# ContainerSettings.validate() requires the rules mount to be a directory, and
+# an absent one is created root-owned by the docker daemon -- which the
+# uid-1000 updater then cannot write to.
+rules-live/**
+!rules-live/.gitkeep
+
 # --- IMAP credentials: bridge-generated, never committed (README "Running the
 # dispatcher against the Proton bridge"). The sample stays. ---
 config/secrets.json

@@ -8,8 +8,9 @@ Two feeds live under ``rules/reference/``:
   for a sender who is not whitelisted.
 
 Both are *reference data*, not logic. They are expected to be updated far more
-often than the engine or the scan rules, eventually by pulling this repository
-on an interval (see the README TODO), so they are read defensively.
+often than the engine or the scan rules -- which is what the ``rules_sync``
+auto-updater now does, pulling this repository on an interval (README,
+"Auto-updating the pack") -- so they are read defensively.
 
 TWO OPPOSITE FAILURE MODES, ON PURPOSE. DO NOT UNIFY THEM.
 =========================================================
@@ -36,8 +37,11 @@ Resolution order for a feed, highest first:
     1. the validated file under ``rules/reference/``
     2. TODO(cache): a last-known-good copy of the last feed that loaded
        cleanly, so a bad update degrades to yesterday's signatures rather than
-       all the way to the baseline. Not implemented -- there is nowhere to
-       cache to until the interval pull exists.
+       all the way to the baseline. Still not implemented HERE. The updater
+       covers the case this was written for -- it rejects a bad pull whole, so
+       the previous pack stays live and a corrupt feed never reaches this
+       resolution order -- but a feed corrupted in place, after promotion,
+       still falls straight through to 3.
     3. nothing: triage falls back to its hard-baked baseline markers.
 """
 

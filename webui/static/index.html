@@ -82,6 +82,20 @@
 
       <div class="card">
         <div class="card-title">Config</div>
+
+        <div class="cfg-lbl">Rules pack</div>
+        <div id="rulesStatus" class="phase-note">Checking…</div>
+        <div class="add-row" style="margin-top:6px;">
+          <button class="btn" style="flex:1" id="refreshRules">Refresh rules</button>
+        </div>
+        <div id="rulesOutcome" class="copy-hint hidden"></div>
+        <div id="rulesError" class="error-note hidden"></div>
+        <div class="copy-hint" style="margin-bottom:14px;">
+          Pulls the rules pack from Git, validates it, and promotes it. An invalid
+          pack is refused and the current one keeps running. The next message scanned
+          uses whatever is live — nothing restarts.
+        </div>
+
         <div class="cfg-lbl">Inbound bridge address</div>
         <input class="form-entry" id="inbound" value="raven_omnicore@pm.me">
         <div class="cfg-lbl" style="margin-top:12px;">Outbound POST webhooks</div>

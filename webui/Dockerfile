@@ -33,6 +33,9 @@ COPY scanner/ ./scanner/
 COPY dispatcher/ ./dispatcher/
 COPY webui/ ./webui/
 COPY config/config.json ./config/config.json
+# The fourth declared package root. The console does not import the rules
+# updater -- it reaches it over HTTP -- but `packages.find` must still resolve.
+RUN mkdir -p rules_sync
 
 # Editable, because the served assets (`webui/static/`) live beside the package
 # rather than inside it -- an editable install keeps the source layout the

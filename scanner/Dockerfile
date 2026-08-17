@@ -36,7 +36,7 @@ WORKDIR /app
 # the scanner image has no business containing the process that runs it.
 COPY pyproject.toml ./
 COPY scanner/ ./scanner/
-RUN mkdir -p dispatcher webui
+RUN mkdir -p dispatcher webui rules_sync
 
 # Zero runtime dependencies by design (pyproject.toml): the scanner parses mail
 # with the stdlib `email` package, which is what lets this image stay small and

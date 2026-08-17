@@ -53,7 +53,7 @@ COPY pyproject.toml ./
 COPY dispatcher/ ./dispatcher/
 COPY scanner/ ./scanner/
 COPY config/config.json ./config/config.json
-RUN mkdir -p webui
+RUN mkdir -p webui rules_sync
 
 RUN pip install --no-cache-dir . \
  && rm -rf /root/.cache

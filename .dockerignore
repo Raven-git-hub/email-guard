@@ -5,6 +5,12 @@
 data/
 config/secrets.json
 
+# The rules auto-updater's promoted releases and its sparse git working copy.
+# Derived state that belongs to the host, mounted at runtime -- and `work/`
+# carries a whole `.git`, which is exactly what `.git/` below exists to keep
+# out of a build context.
+rules-live/
+
 # Holds the bridge-generated IMAP credentials. Compose reads it from the host;
 # no image has any business containing it.
 .env

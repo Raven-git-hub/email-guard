@@ -12,6 +12,8 @@ Shape of the thing:
     POST /api/decisions         one decision -> the applier -> the live lists
     GET  /api/lists/{name}      entries for the List Data panel
     POST /api/lists/{name}/add  a manual add, down the same applier path
+    GET  /api/rules/status      what rules pack is live, and when it landed
+    POST /api/rules/refresh     ask the rules updater to pull now
 
 Three things are load-bearing rather than stylistic:
 
@@ -45,7 +47,9 @@ from email_guard.lists import LIST_NAMES, InvalidLists, Lists
 from . import candidates as candidates_module
 from . import decisions as decisions_module
 from . import listing
+from . import rules as rules_module
 from .config import AUTH_HEADER, WebUIConfig
+from .rules import UpdaterUnreachable
 
 INDEX_NAME = "index.html"
 
@@ -170,6 +174,21 @@ def create_app(
             },
         )
 
+    @app.exception_handler(UpdaterUnreachable)
+    async def updater_unreachable(request: Request, exc: UpdaterUnreachable) -> JSONResponse:
+        """503, and only for "there is no updater to ask".
+
+        Note what does NOT come through here: a pull that ran and rejected a bad
+        pack, or found nothing new, or was already running. Those are results,
+        not failures, and they return 200 with a ``status`` the console reads.
+        This is reserved for the case where the console could not put the
+        question to anyone -- no updater configured, or it did not answer.
+        """
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc), "errors": [str(exc)]},
+        )
+
     app.include_router(api_router())
 
     if static_dir.is_dir():
@@ -278,6 +297,37 @@ def api_router() -> APIRouter:
         )
         document = decisions_module.build_document(decision, today=request.app.state.today())
         return {"list": list_name, "report": apply_decisions(document, config.lists_dir)}
+
+    # --- the rules pack ---------------------------------------------------
+    #
+    # Both handlers are declared `def`, not `async def`, and that is deliberate
+    # rather than an oversight -- every other handler in this file is async.
+    # They make a blocking HTTP call to the updater; FastAPI runs a sync handler
+    # in a threadpool, so the event loop keeps serving while a pull (which can
+    # take a minute: clone, copy, run the validator) is in flight. An `async def`
+    # around a blocking urllib call would stall the whole console.
+
+    @router.post("/rules/refresh")
+    def post_rules_refresh(request: Request) -> dict[str, Any]:
+        """Pull the rules pack now, and report exactly what happened.
+
+        Every outcome the updater can produce -- promoted, unchanged, rejected,
+        busy -- comes back as HTTP 200 with a ``status`` field, because all four
+        mean the request was handled. A rejected pack in particular is the
+        system working: the validator caught a bad pack and the live rules were
+        left alone. Returning 5xx for that would make a correct refusal
+        indistinguishable from an outage.
+
+        Only "there is no updater to ask" is an error, and that is a 503.
+        """
+        client = rules_module.client_for(_config(request))
+        return client.refresh()
+
+    @router.get("/rules/status")
+    def get_rules_status(request: Request) -> dict[str, Any]:
+        """What the live pack is right now. Runs no pull and takes no lock."""
+        client = rules_module.client_for(_config(request))
+        return client.status()
 
     return router
 

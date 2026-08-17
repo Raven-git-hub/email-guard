@@ -367,6 +367,179 @@ route off the host is a deliberate decision, made in a file that is not tracked.
 
 ---
 
+## 9. The rules auto-updater, and cutting over to it
+
+The `rules-updater` service pulls the rules pack from GitHub, validates it, and
+promotes it by swapping a symlink. Nothing restarts when it does: each message is
+scanned by a fresh `docker run --rm` that mounts the rules directory at scan
+time, so the next message picks up the new pack on its own.
+
+It comes up with the stack and starts working immediately, but **it changes
+nothing that scans until you cut the mounts over** — that is step 9.4, and it is
+a deploy-time change, not something the code does for you.
+
+### 9.1 Confirm it seeded itself
+
+**The live tree serves the committed pack before any pull has succeeded.** On
+first start the updater copies `./rules` into `rules-live/` and points `current`
+at it, so the promote target is never empty:
+
+```sh
+docker compose up -d rules-updater
+docker compose logs rules-updater | tail -20
+readlink rules-live/current
+```
+
+Expect a log line `seeding the live rules tree from the committed pack`, and a
+readlink of `releases/seed/rules` — or `releases/<sha>/rules` if a pull has
+already landed.
+
+**The symlink must be relative.** If `readlink` prints something starting with
+`/`, stop: an absolute target resolves only in whichever filesystem wrote it and
+will dangle inside the dispatcher and inside every scan container.
+
+**The promoted tree is a valid pack**, checked with the same validator the engine
+runs on load:
+
+```sh
+python rules/validate.py rules-live/current
+```
+
+Expect `rules pack OK`.
+
+### 9.2 Trigger a manual pull and read the result
+
+From the console: open the **Config** panel and click **Refresh rules**. The
+panel shows the live commit, the last-pull time, and the outcome of the click.
+
+The equivalent from the host, which is also the way to see the whole structured
+result:
+
+```sh
+curl -sS -X POST http://127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}/api/rules/refresh \
+     -H "X-Email-Guard-Token: $EMAIL_GUARD_WEBUI_TOKEN" | python -m json.tool
+```
+
+(Drop the `-H` if no console token is configured.)
+
+`status` is the field that matters, and every value below is an HTTP 200 — a
+refused pack is the updater working, not a broken button:
+
+| `status` | What happened |
+|---|---|
+| `updated` | A new commit was validated and promoted. `new_commit` is now live. |
+| `no_change` | Upstream is already the promoted commit. Nothing was staged or swapped. |
+| `rejected` | The pulled pack failed validation. **The live pack is unchanged** and `validation_errors` says why. |
+| `busy` | Another pull held the lock. Nothing was changed. |
+| `error` | The pull could not run — unreachable host, missing branch. `message` says which. |
+
+Running it a second time immediately must return `no_change`. If it returns
+`updated` twice for the same upstream commit, the promote is not idempotent and
+something is wrong.
+
+### 9.3 Prove a bad pack cannot go live
+
+**A rejected pull leaves the live pack exactly as it was.** This is the drill
+worth doing once on a real host, because it is the guarantee the whole design
+rests on. On a scratch branch of the rules repo, commit a deliberately broken
+rule — `echo 'not json' > rules/scan/level2.json` — then point the updater at it:
+
+```sh
+# docker-compose.override.yml, or just in .env
+#   EMAIL_GUARD_RULES_BRANCH=broken-on-purpose
+docker compose up -d rules-updater
+readlink rules-live/current          # note this value
+docker compose run --rm rules-updater python -m email_guard_rules_sync --once
+readlink rules-live/current          # must be UNCHANGED
+```
+
+Expect exit code 2, `"status": "rejected"`, the validator's own error text in
+`validation_errors`, and an identical `readlink` before and after. Scanning
+continues on the known-good pack throughout.
+
+The opposite half is worth confirming too: corrupt
+`rules/reference/injection_signatures.json` instead and the pull **succeeds**,
+with a warning. The signature feed fails open on purpose — a truncated download
+must cost sensitivity, not stop the mail.
+
+### 9.4 Cut over to the managed rules tree
+
+Until this step, the scanner still reads the committed `./rules` and pulls change
+nothing that scans. Repoint both mounts by setting two variables in `.env`:
+
+```sh
+EMAIL_GUARD_RULES_LIVE_NAME=rules-live
+EMAIL_GUARD_RULES_LIVE_POINTER=/current
+```
+
+**Order matters.** `rules-live/current` must exist first, or the dispatcher
+refuses to start on a rules directory that is not there:
+
+```sh
+docker compose run --rm rules-updater python -m email_guard_rules_sync --once
+readlink rules-live/current          # must print releases/<something>/rules
+docker compose up -d dispatcher
+```
+
+Confirm the dispatcher took the new mount:
+
+```sh
+docker compose exec dispatcher printenv EMAIL_GUARD_HOST_RULES_DIR
+docker compose exec dispatcher ls /app/rules/current/scan
+```
+
+Expect a path ending `/rules-live/current`, and the three `levelN.json` files.
+
+> **Why the bind is `rules-live/`, not `rules-live/current`.** A bind mount of a
+> symlink is resolved once, by the daemon, when the container starts — the
+> container gets the release the link pointed at *then*, and a later swap is
+> invisible to it forever. Binding the directory mounts the directory itself, so
+> `current` is an entry inside it and the next path walk sees the new target.
+> That is why `EMAIL_GUARD_RULES_LIVE_POINTER` moves the `/current` onto the
+> container path instead of into the bind.
+>
+> Scan containers are the opposite case and are already handled: each is created
+> fresh per message, so the daemon resolving `.../current` at create time gives
+> that container one immutable release for its whole life. A promote landing
+> mid-scan cannot affect a scan already running.
+
+### 9.5 Confirm the next scan actually used the new rules
+
+This is the check that closes the loop — everything above proves the *files*
+moved, not that a scan read them.
+
+```sh
+# 1. what is live right now
+readlink rules-live/current
+
+# 2. send a test message, then catch its container mid-flight
+docker inspect $(docker ps -q --filter label=email-guard.role=scanner) \
+  --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} (rw={{.RW}}){{"\n"}}{{end}}'
+```
+
+Expect a line whose source resolves to the release from step 1, destination
+`/rules`, and **`rw=false`**. The scanner only ever reads the rules; the updater
+is the only component in the stack with a writable rules mount.
+
+If the source still ends in a plain `/rules`, the cutover in 9.4 has not taken
+effect — the dispatcher was not recreated after the `.env` edit.
+
+### 9.6 Confirm the blast radius
+
+**A rules pull touches the rules and nothing else.** The live lists are personal
+data, are never in git, and no part of this feature can reach them:
+
+```sh
+docker inspect email-guard-rules-updater \
+  --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} (rw={{.RW}}){{"\n"}}{{end}}'
+```
+
+Expect exactly two mounts — `rules-live` read-write and `rules` read-only — and
+**no** `data` volume and **no** `/var/run/docker.sock`. The updater creates no
+containers, so it has no docker access at all.
+
+---
+
 ## Diagnosis
 
 ### The socket-proxy allow-list is too short
@@ -531,6 +704,68 @@ permissions mismatch, where the scanner container's uid cannot write into a
 spool directory the dispatcher created. Both should be
 `EMAIL_GUARD_UID:EMAIL_GUARD_GID`; confirm with `docker compose exec dispatcher id`.
 
+### The rules never update, and the updater looks fine
+
+**Symptom.** `docker compose logs rules-updater` shows `rules updated: … -> …`,
+`readlink rules-live/current` moves — and scans behave exactly as before.
+
+Almost always the cutover in §9.4 has not been done, or was done without
+recreating the dispatcher. The updater writes `rules-live/`; the scanner reads
+whatever `EMAIL_GUARD_HOST_RULES_DIR` names, and that still says `.../rules`:
+
+```sh
+docker compose exec dispatcher printenv EMAIL_GUARD_HOST_RULES_DIR
+```
+
+If it does not end in `/rules-live/current`, set both variables in `.env` and
+`docker compose up -d dispatcher`.
+
+The subtler version of this is a dispatcher that was started when the bind was
+`rules-live/current` rather than `rules-live/`. It will serve the release that
+was live at its start, forever, and look entirely healthy doing so. Check:
+
+```sh
+docker inspect email-guard-dispatcher \
+  --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' | grep rules
+```
+
+The source must be the directory, not the symlink.
+
+### The updater logs `could not read Username` or `Authentication failed`
+
+**Symptom.** Every pull returns `status: error` with a message about
+credentials, against a repository you can clone by hand.
+
+The updater pulls **public** repositories only. It supplies no credentials and
+cannot be made to: prompting is disabled, `GIT_ASKPASS` is `/bin/false`, the
+credential helper list is cleared on every invocation, and `~/.gitconfig` and
+`/etc/gitconfig` are both pointed at `/dev/null`. A private repository therefore
+fails, and this is that failure surfacing.
+
+If `EMAIL_GUARD_RULES_REPO_URL` really is public, check the URL for a typo — a
+nonexistent public repository and a private one are indistinguishable to an
+unauthenticated client, and GitHub returns "not found" for both.
+
+An `ssh://` or `git@host:path` URL is refused at startup rather than attempted,
+with a message saying so on stderr.
+
+### The updater cannot write, or the dispatcher will not start on the rules mount
+
+**Symptom.** `Permission denied` under `rules-live/` in the updater's logs, or
+the dispatcher exits with `container.rules_dir (…) does not exist inside the
+dispatcher`.
+
+The usual cause is an absent `rules-live/` on the host: docker creates a missing
+bind source as a **root-owned** directory, which the uid-1000 updater then cannot
+write into. The repository ships `rules-live/.gitkeep` so a fresh clone owns the
+directory; if it went missing:
+
+```sh
+mkdir -p rules-live && touch rules-live/.gitkeep
+sudo chown -R "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}" rules-live
+docker compose up -d rules-updater
+```
+
 ### Orphaned containers after a hard kill
 
 By design: `--rm` only fires on a clean exit, so a dispatcher killed mid-scan
@@ -562,3 +797,14 @@ Even a clean run of this runbook leaves these untested by anything in the repo:
   reproduce.
 - Rootless Docker, Docker Desktop, and SELinux-enforcing hosts (which may
   require `:z` / `:Z` on the bind mounts).
+- **A promote landing while a scan is in flight.** The reasoning is sound —
+  the daemon resolves the symlink at container-create time, so a running scan
+  holds its own release — and the release-pruning hold-down keeps that
+  directory alive for an hour afterwards. But the race has never actually been
+  run: it needs a promote timed against a live scan on a busy mailbox.
+- **A real upstream force-push.** The non-fast-forward refusal is covered by a
+  test against a local repository; whether GitHub's transport surfaces it the
+  same way on a genuine rewritten branch is unproven.
+- **Whether 24h is the right interval.** It is a guess. The feed is the part
+  that wants updating often, and nothing here yet measures how quickly a new
+  signature ought to reach a running deployment.

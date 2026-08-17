@@ -49,6 +49,46 @@ The rules pack contains:
 > Replaces the prototype's pattern of storing logic as JavaScript strings run through
 > `new Function()`, where a stray syntax error broke a scan at runtime with no warning.
 
+### Auto-updating the pack
+
+The `rules-updater` service pulls the pack from git on an interval (24h by default),
+validates it, and promotes it — so a security update lands by pushing to the rules repo,
+with no redeploy and **no restart of anything**. There is a **Refresh rules** button in
+the review console's Config panel for when you would rather not wait.
+
+Nothing restarts because nothing is holding the old rules: each message is scanned by a
+fresh `docker run --rm` that mounts the rules directory at scan time, so updating the
+files the *next* container will mount is the entire job.
+
+Two properties make that safe to point at live mail:
+
+- **Promotion is atomic.** A pulled pack is staged into `rules-live/releases/<sha>/`,
+  which nothing points at, and goes live by swapping a symlink. A scan container starting
+  at any instant resolves either the old release or the new one — never a half-written
+  tree — and a scan already running keeps the release it started with.
+- **The pack's own failure split is preserved exactly.** Scan rules **fail closed**: any
+  validator error and the pull is *rejected*, the live pack is untouched, and scanning
+  continues on the known-good rules. The signature feed **fails open**: a malformed or
+  missing `reference/*_signatures.json` is a warning that still promotes. This is the
+  same asymmetry the runtime enforces, for the same reason — a truncated download must
+  cost sensitivity, not stop the mail.
+
+The updater is deliberately the narrowest component in the stack: it has **no docker
+access** (it creates no containers), **no access to the data volume** (a rules update and
+a list edit are independent, and the lists are personal data that is not in git at all),
+and it is the **only** component with a writable rules mount. The console has neither git
+nor write access; it asks the updater over an internal network, so exactly one process
+owns the write path and a scheduled pull cannot race a manual one.
+
+It runs whether or not the scanner has been pointed at the managed tree. Cutting over is
+a **deploy-time change** — two variables in `.env` — documented in `.env.sample` and in
+VALIDATION.md, "The rules auto-updater, and cutting over to it".
+
+> The validator imports the pulled pack's Python in order to check it, so the updater runs
+> it as a subprocess. That is isolation and repeatability, **not a sandbox** — the real
+> controls are the container's: non-root, read-only rootfs, all capabilities dropped, no
+> docker, no lists. It does have egress, which is the honest residual risk.
+
 ---
 
 ## Status
@@ -58,7 +98,8 @@ The rules pack contains:
 | Detection logic (levels 2–4) | Exists in prototype (JS strings), to re-express as a rules pack |
 | Source cleaners (Outlook / Gmail / Proton) | Provided; contracts to be standardised |
 | Triage / initial level assignment | Exists; greylist matching to be updated to current schema |
-| Signature reference DB (`rules/reference/`) | **Scaffolded** — injection feed seeded, phishing feed empty by design; static loader that fails open. Interval-pulling from git not built |
+| Signature reference DB (`rules/reference/`) | **Scaffolded** — injection feed seeded, phishing feed empty by design; static loader that fails open |
+| Rules pack auto-updater (`rules_sync/`) | **Built, unvalidated on a host** — scheduled `git pull` plus a manual refresh from the console, validated and promoted atomically by symlink swap. Repointing the scanner's mounts at the managed tree is a deploy-time change — see `VALIDATION.md` §9 |
 | Dispatcher (bridge IMAP → scanner) | **Built** — on-arrival via IMAP `IDLE`, with the poll loop kept as the correctness backstop. Two scanner runners behind one interface: subprocess (dev) and one hardened container per message (deployed). Plus `--rescan`, the one-shot onboarding pass over an entire existing mailbox |
 | Per-message scanner container | **Built, unvalidated on a host** — `scanner/Dockerfile` plus `ContainerRunner`: `docker run --rm`, no network, read-only root, non-root, caps dropped, memory/pid/cpu bounded, Docker reached via a socket-proxy. Built where no Docker daemon exists, so the container path has never actually run — see `VALIDATION.md` |
 | Canary (local LLM) semantic checks | **To be built** |
@@ -353,8 +394,11 @@ Resolution order, highest first:
 
 1. the validated file under `rules/reference/`
 2. *TODO(cache):* a last-known-good copy of the last feed that loaded cleanly, so a bad update
-   degrades to yesterday's signatures rather than all the way to the baseline. Not implemented
-   — there is nowhere to cache to until the interval pull exists.
+   degrades to yesterday's signatures rather than all the way to the baseline. Still not
+   implemented **in the loader**. The auto-updater now covers the case this was written for —
+   a bad *pull* is rejected whole and the previous pack stays live, so a corrupt feed never
+   reaches this resolution order — but a feed corrupted in place, after promotion, still
+   falls straight through to 3.
 3. nothing — triage falls back to the hard-baked floor in `scanner/email_guard/triage.py`.
    This is a permanent baseline, not a default the feed replaces: the feed only ever adds
    to it.
@@ -384,10 +428,12 @@ Both halves are held to the same precision bar, against one shared false-positiv
 same reason the feed seeds do: "please disregard the previous **email**" is a routine
 correction notice, "disregard the previous **instructions**" is not.
 
-> **TODO(feed-pull):** pulling this repository on an interval so signature updates land without
-> a redeploy is the intended operating mode, and is what the fail-open behaviour above exists
-> to protect. **Not built.** Today the loader is static — the feeds are read once when the
-> rules pack loads, from whatever is on disk.
+> **Interval pulling: built.** Pulling this repository on an interval so signature updates
+> land without a redeploy is the intended operating mode, and is what the fail-open behaviour
+> above exists to protect — see "Auto-updating the pack". The loader itself is unchanged and
+> still static: it reads the feeds once, when the rules pack loads, from whatever is on disk.
+> That stays correct because a scan container is created per message, so "once per load" is
+> once per message.
 
 ---
 
@@ -907,9 +953,11 @@ section of `config/config.json` or the environment (`EMAIL_GUARD_WEBUI_HOST`,
 - **List Data** — the live entries per list, greylist structures with their resolved
   dispositions, and a manual **Add** that builds a decision and applies it down the same
   path. There is no second way into `data/lists/`.
-- **Event Log** and **Config** are present but inert — the event store and the dispatcher
-  config wiring are Phase 2. The Config panel's SAVE is disabled rather than silent, and the
-  recognitions chart is empty rather than invented.
+- **Event Log** is present but inert — the event store is Phase 2. **Config** is inert with
+  one exception: **Refresh rules** is live, and pulls the rules pack through the
+  rules-updater service (see "Auto-updating the pack"). Everything else on that panel is
+  still a placeholder — SAVE is disabled rather than silent, and the recognitions chart is
+  empty rather than invented.
 
 ### Why it binds loopback
 

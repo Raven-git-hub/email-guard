@@ -44,6 +44,13 @@ ENV_FRAME_ANCESTORS = "EMAIL_GUARD_WEBUI_FRAME_ANCESTORS"
 ENV_ALLOW_NON_LOOPBACK = "EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK"
 ENV_SECRETS = "EMAIL_GUARD_SECRETS"
 
+# Where the rules updater's control endpoint lives, and the token for it. The
+# console has no git and no write access to the rules tree by design: it asks
+# the updater instead, so exactly one component owns git and the write path.
+# Unset means "no updater in this deployment", and the refresh endpoint says so.
+ENV_RULES_CONTROL_URL = "EMAIL_GUARD_RULES_CONTROL_URL"
+ENV_RULES_CONTROL_TOKEN = "EMAIL_GUARD_RULES_CONTROL_TOKEN"
+
 # The header a client presents the shared token in, when one is configured.
 AUTH_HEADER = "X-Email-Guard-Token"
 
@@ -75,6 +82,9 @@ class WebUIConfig:
     frame_ancestors: str = DEFAULT_FRAME_ANCESTORS
     static_dir: Path = STATIC_DIR
     config_path: Path | None = None
+    rules_control_url: str | None = None
+    # `repr=False` for the same reason `auth_token` has it.
+    rules_control_token: str | None = field(default=None, repr=False)
 
     @property
     def is_loopback(self) -> bool:
@@ -162,6 +172,8 @@ def load(
             or DEFAULT_FRAME_ANCESTORS
         ),
         config_path=scanner.config_path,
+        rules_control_url=(env.get(ENV_RULES_CONTROL_URL) or "").strip() or None,
+        rules_control_token=(env.get(ENV_RULES_CONTROL_TOKEN) or "").strip() or None,
     )
 
 

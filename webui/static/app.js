@@ -50,6 +50,7 @@ const state = {
   curList: 'greylist',
   entries: [],
   hooks: ['https://n8n.local/webhook/email-guard'],
+  rules: null,        // the live rules pack, as the updater reports it
 };
 
 // --- tiny DOM helpers ----------------------------------------------------------
@@ -801,9 +802,112 @@ function wireListPanel() {
   });
 }
 
+// --- rules pack ----------------------------------------------------------------
+
+/* The one live control on the Config panel. Everything else here is still a
+ * Phase-2 placeholder, and SAVE stays disabled rather than lying about it.
+ *
+ * The console does not pull the rules itself: it asks the rules-updater
+ * service, which is the only component with git and the only one that can write
+ * the rules tree. So every outcome below is the updater's own result, passed
+ * through unchanged. */
+
+const RULES_OUTCOMES = {
+  updated: (payload) => 'Updated to ' + shortSha(payload.new_commit) + '.',
+  no_change: () => 'Already up to date — nothing to promote.',
+  rejected: () => 'Rejected: the pulled pack failed validation. The current rules are still live.',
+  busy: () => 'Another pull is already running. Nothing was changed.',
+  error: (payload) => 'Could not pull: ' + (payload.message || 'unknown error'),
+};
+
+function shortSha(sha) {
+  if (!sha) return 'unknown';
+  return String(sha).slice(0, 12);
+}
+
+function whenText(stamp) {
+  if (!stamp) return 'never';
+  const parsed = new Date(stamp);
+  return isNaN(parsed.getTime()) ? String(stamp) : parsed.toLocaleString();
+}
+
+function renderRulesStatus(status) {
+  const box = byId('rulesStatus');
+  clear(box);
+
+  if (!status) {
+    box.appendChild(el('div', null, 'Rules status unavailable.'));
+    return;
+  }
+
+  const commit = el('div', null, '');
+  commit.appendChild(el('b', null, shortSha(status.current_commit)));
+  commit.appendChild(document.createTextNode(' on ' + (status.branch || 'main')));
+  box.appendChild(commit);
+  box.appendChild(el('div', null, 'Last pull: ' + whenText(status.last_pull_at)));
+
+  if (status.last_status === 'rejected') {
+    const warn = el('div', null, 'Last pull was rejected — running on the previous pack.');
+    box.appendChild(warn);
+  }
+  (status.validation_errors || []).forEach((error) => {
+    box.appendChild(el('div', null, '• ' + error));
+  });
+}
+
+function showRulesError(message) {
+  const note = byId('rulesError');
+  note.textContent = message || '';
+  note.classList.toggle('hidden', !message);
+}
+
+function showRulesOutcome(message) {
+  const note = byId('rulesOutcome');
+  note.textContent = message || '';
+  note.classList.toggle('hidden', !message);
+}
+
+async function loadRulesStatus() {
+  const status = await getJSON('/api/rules/status');
+  state.rules = status;
+  renderRulesStatus(status);
+}
+
+async function refreshRules() {
+  const button = byId('refreshRules');
+  button.disabled = true;
+  showRulesError('');
+  showRulesOutcome('Pulling…');
+
+  try {
+    const payload = await postJSON('/api/rules/refresh', {});
+    const describe = RULES_OUTCOMES[payload.status];
+    showRulesOutcome(describe ? describe(payload) : 'Finished: ' + payload.status);
+
+    /* Validation errors belong next to the outcome, not in a toast: there can
+     * be several, and they are the whole reason a pack was refused. */
+    if (payload.status === 'rejected') {
+      showRulesError((payload.validation_errors || []).join('; '));
+    }
+    (payload.warnings || []).forEach((warning) => toast('Signature feed: ' + warning));
+
+    await loadRulesStatus().catch(() => {});
+  } catch (err) {
+    showRulesOutcome('');
+    showRulesError(err.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function wireRulesPanel() {
+  byId('refreshRules').addEventListener('click', () => { refreshRules(); });
+}
+
 async function start() {
   wireChrome();
   wireListPanel();
+  wireRulesPanel();
   renderHooks();
   renderReview();
   renderList();
@@ -818,6 +922,14 @@ async function start() {
     await refreshList();
   } catch (err) {
     toast(err.message);
+  }
+  /* Tolerant: a deployment that is not running the rules updater is a
+   * legitimate one, and the rest of the console must still work. */
+  try {
+    await loadRulesStatus();
+  } catch (err) {
+    renderRulesStatus(null);
+    showRulesError(err.message);
   }
 }
 

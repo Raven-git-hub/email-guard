@@ -99,8 +99,19 @@ services:
       # and where the host daemon must be told to find it.
       EMAIL_GUARD_CONTAINER_DATA_DIR: "/app/data"
       EMAIL_GUARD_HOST_DATA_DIR: "${EMAIL_GUARD_HOST_ROOT:?set EMAIL_GUARD_HOST_ROOT in .env to this repo's absolute path on the host}/data"
-      EMAIL_GUARD_CONTAINER_RULES_DIR: "/app/rules"
-      EMAIL_GUARD_HOST_RULES_DIR: "${EMAIL_GUARD_HOST_ROOT}/rules"
+      # WHICH rules tree the scanner reads. Both lines are parameterised, and
+      # the defaults reproduce the pre-auto-updater wiring exactly: `./rules`,
+      # the committed pack. Setting the two variables in .env is the whole
+      # cutover to the managed, auto-updated tree -- see .env.sample and
+      # VALIDATION.md, "Cut over to the managed rules tree".
+      #
+      #   default   NAME=rules       POINTER=          -> ${ROOT}/rules
+      #   cut over  NAME=rules-live  POINTER=/current  -> ${ROOT}/rules-live/current
+      #
+      # The POINTER suffix is what makes a promote visible to THIS long-lived
+      # container. See the volume below.
+      EMAIL_GUARD_CONTAINER_RULES_DIR: "/app/rules${EMAIL_GUARD_RULES_LIVE_POINTER:-}"
+      EMAIL_GUARD_HOST_RULES_DIR: "${EMAIL_GUARD_HOST_ROOT}/${EMAIL_GUARD_RULES_LIVE_NAME:-rules}${EMAIL_GUARD_RULES_LIVE_POINTER:-}"
       EMAIL_GUARD_CONTAINER_USER: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
 
       EMAIL_GUARD_IMAP_HOST: "bridge"
@@ -168,7 +179,24 @@ services:
       - email-guard-data:/app/data
       # The rules pack is version-controlled, not runtime data: read-only here,
       # and read-only again in every scanner container.
-      - ./rules:/app/rules:ro
+      #
+      # After the cutover this binds `rules-live/` -- the DIRECTORY that holds
+      # the `current` symlink -- and never `rules-live/current` itself. That
+      # distinction is the whole reason a promote is visible without a restart:
+      #
+      #   * binding `.../current` makes the daemon resolve the symlink once, at
+      #     container start, and mount the release it pointed at THEN. A later
+      #     swap renames a directory entry this mount no longer consults, so
+      #     this long-lived container would be pinned to that release forever.
+      #   * binding the directory mounts the directory's own inode, so `current`
+      #     is an entry inside it and the next path walk sees the new target.
+      #
+      # (`:ro` restricts writes through the mount; it does not freeze the
+      # directory's contents.) Each SCANNER container is the opposite case and
+      # wants the opposite thing -- it is fresh per message, so resolving
+      # `.../current` at create time gives it one immutable release for its
+      # whole life, and a swap mid-scan cannot affect it.
+      - "./${EMAIL_GUARD_RULES_LIVE_NAME:-rules}:/app/rules:ro"
       - ./config/config.json:/app/config/config.json:ro
 
     read_only: true
@@ -242,6 +270,98 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # -- the only component that runs git --------------------------------------
+  #
+  # Pulls the rules pack on an interval, validates it, and swaps a symlink so
+  # the NEXT scanner container mounts the new tree. Nothing restarts: each
+  # message is scanned by a fresh `docker run --rm`, so no long-lived process is
+  # holding the old rules.
+  #
+  # Note what it deliberately cannot reach:
+  #
+  #   * NO /var/run/docker.sock and no DOCKER_HOST. It never creates a
+  #     container, so it has no business being able to. The socket-proxy's
+  #     allow-list is not widened for it.
+  #   * NO data volume. The live lists, the daily brief and the dispatcher's
+  #     state are personal data. A rules update and a list edit are independent
+  #     operations, and this service touches only the first.
+  #
+  # It is the ONLY service in this file with a read-write rules mount. The
+  # dispatcher's is `:ro`, and every scanner container's is `:ro` again.
+  #
+  # It runs whether or not the mounts have been cut over: until they are, it
+  # maintains `rules-live/` alongside the `./rules` the scanner is still
+  # reading, and the console shows what it has promoted. That makes the cutover
+  # a two-line .env change against a tree that is already known to be good.
+  rules-updater:
+    build:
+      context: .
+      dockerfile: rules_sync/Dockerfile
+    image: email-guard-rules-updater:0.1.0
+    container_name: email-guard-rules-updater
+    restart: unless-stopped
+
+    # `egress` to reach GitHub; `rulesctl` so the console can ask for a manual
+    # pull. Deliberately NOT on `mail` or `dockerproxy`.
+    networks: [egress, rulesctl]
+
+    # The operator's uid, so the tree this writes stays editable by hand on the
+    # host -- the same reasoning as the console's.
+    user: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
+
+    environment:
+      EMAIL_GUARD_RULES_REPO_URL: "${EMAIL_GUARD_RULES_REPO_URL:-https://github.com/Raven-git-hub/email-guard}"
+      EMAIL_GUARD_RULES_BRANCH: "${EMAIL_GUARD_RULES_BRANCH:-main}"
+      EMAIL_GUARD_RULES_SUBPATH: "${EMAIL_GUARD_RULES_SUBPATH:-rules}"
+      # 24h by default; `off` disables the schedule and leaves manual refresh.
+      EMAIL_GUARD_RULES_PULL_INTERVAL: "${EMAIL_GUARD_RULES_PULL_INTERVAL:-24h}"
+      EMAIL_GUARD_RULES_KEEP_RELEASES: "${EMAIL_GUARD_RULES_KEEP_RELEASES:-3}"
+
+      # The promote target, and the committed pack it seeds itself from.
+      EMAIL_GUARD_RULES_LIVE_DIR: "/app/rules-live"
+      EMAIL_GUARD_RULES_SEED_DIR: "/app/rules"
+
+      # The control endpoint the console calls. 0.0.0.0 binds the container's
+      # interface on `rulesctl` only -- there is no `ports:` key below, so it is
+      # never published to the host.
+      EMAIL_GUARD_RULES_CONTROL_HOST: "0.0.0.0"
+      EMAIL_GUARD_RULES_CONTROL_PORT: "8090"
+      EMAIL_GUARD_RULES_CONTROL_TOKEN: "${EMAIL_GUARD_RULES_CONTROL_TOKEN:-}"
+
+      # git insists on a HOME, and the rootfs is read-only. /tmp is the tmpfs
+      # below. Nothing is stored there: the point is that `~/.git-credentials`
+      # and `~/.ssh` are not merely ignored, they are not present.
+      HOME: "/tmp/git-home"
+
+    volumes:
+      # THE only read-write rules mount in the stack.
+      - ./rules-live:/app/rules-live
+      # The committed pack, as the seed. Read-only: this service must never
+      # write the tracked tree.
+      - ./rules:/app/rules:ro
+
+    expose:
+      - "8090"
+
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Health is "a scan container starting now would find a usable pack" -- NOT
+    # "the last pull succeeded". An unreachable upstream, or a pack that was
+    # correctly rejected, are both states in which this service is working
+    # exactly as designed, and a restart would help neither.
+    healthcheck:
+      test: ["CMD", "python", "-m", "email_guard_rules_sync.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
   # -- the review console (unchanged) ---------------------------------------
   webui:
     build:
@@ -255,11 +375,26 @@ services:
     # hand on the host. `id -u` / `id -g`, or leave the default.
     user: "${EMAIL_GUARD_UID:-1000}:${EMAIL_GUARD_GID:-1000}"
 
+    # `default` is listed EXPLICITLY. Compose puts a service with no `networks:`
+    # key on the default network; naming `rulesctl` alone would silently take it
+    # off there, and the published port would stop working.
+    networks: [default, rulesctl]
+
     environment:
       EMAIL_GUARD_WEBUI_HOST: "0.0.0.0"
       EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK: "1"
       EMAIL_GUARD_WEBUI_PORT: "8080"
       EMAIL_GUARD_WEBUI_TOKEN: "${EMAIL_GUARD_WEBUI_TOKEN:-}"
+
+      # Where "Refresh rules" goes. The console has no git and no write access
+      # to the rules tree by design -- it asks the updater, so exactly one
+      # component owns git and the write path, and every pull in the system
+      # (scheduled or manual) funnels through that one process's lock.
+      #
+      # Unset this and the button reports that the updater is not configured,
+      # which is the right answer for a deploy that is not running it.
+      EMAIL_GUARD_RULES_CONTROL_URL: "${EMAIL_GUARD_RULES_CONTROL_URL-http://rules-updater:8090}"
+      EMAIL_GUARD_RULES_CONTROL_TOKEN: "${EMAIL_GUARD_RULES_CONTROL_TOKEN:-}"
 
     ports:
       # The container port stays 8080; only the HOST side is configurable, so
@@ -315,6 +450,14 @@ networks:
   # Only the bridge is attached.
   egress:
     driver: bridge
+  # The console's "Refresh rules" button, and nothing else. Internal: no route
+  # off this host, two containers attached. The console needs a way to ask the
+  # updater for a pull, and this is deliberately the narrowest one -- the
+  # alternative, giving the console its own git binary, its own egress and a
+  # read-write rules mount, would put three new powers on the process that
+  # renders hostile mail and create a second writer racing for one symlink.
+  rulesctl:
+    internal: true
 
 volumes:
   # A named volume, so `docker compose down` and a container recreate cannot
