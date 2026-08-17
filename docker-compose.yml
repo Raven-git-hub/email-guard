@@ -34,7 +34,15 @@ services:
 
   # -- the mail source ------------------------------------------------------
   bridge:
-    image: shenxn/protonmail-bridge:latest
+    # Built, not pulled -- see bridge/Dockerfile. The upstream image updates the
+    # bridge binary in place, and the build it now pulls down needs
+    # `libfido2.so.1`, which the image does not ship. The next restart after
+    # that update never opens the IMAP listener, and the failure surfaces here
+    # as a dispatcher that gets EOF from `bridge:143` forever. The three-line
+    # Dockerfile installs the library so a clean `docker compose build && up`
+    # yields a bridge that survives its own auto-updates.
+    build: ./bridge
+    image: email-guard-bridge:0.1.0
     container_name: email-guard-bridge
     restart: unless-stopped
     # Two networks, and it needs both.
@@ -47,8 +55,9 @@ services:
     # get EOF -- a failure that looks like a dispatcher bug and is not one.
     #
     # The dispatcher stays off `egress` deliberately: it needs the bridge and
-    # the socket-proxy, and nothing else. (If you set dispatcher.webhook_url to
-    # something off-host, it will need `egress` added here too.)
+    # the socket-proxy, and nothing else. (An OFF-HOST webhook target is the one
+    # thing that changes that -- see EMAIL_GUARD_WEBHOOK_URL below. An on-host
+    # one does not: it is reached over that service's own network instead.)
     networks: [mail, egress]
     volumes:
       # The existing, already-logged-in bridge state. Read-write: the bridge
@@ -133,6 +142,27 @@ services:
       # Bridge-generated credentials -- not the Proton account password.
       EMAIL_GUARD_IMAP_USERNAME: "${EMAIL_GUARD_IMAP_USERNAME:?set it in .env}"
       EMAIL_GUARD_IMAP_PASSWORD: "${EMAIL_GUARD_IMAP_PASSWORD:?set it in .env}"
+
+      # Where each verdict is POSTed, if anywhere. Empty by default: unset means
+      # no webhook sink is built at all, and the dispatcher stays egress-free.
+      #
+      # WHICH URL depends on where the target lives, and the answer that works
+      # is usually the un-obvious one:
+      #
+      #   * ON THIS HOST (n8n, say): reach it over ITS docker network with its
+      #     INTERNAL url -- `http://n8n:5678/webhook/...`. Attach the dispatcher
+      #     to that network in an override file. Going out to the public
+      #     hostname instead means a round-trip through the edge, and an edge bot
+      #     filter will happily eat a POST from a container: Cloudflare answers
+      #     `error 1010` and the delivery never lands.
+      #   * OFF THIS HOST: a public URL, and the dispatcher then needs `egress`
+      #     added to its `networks` in an override too. It has none by default,
+      #     so an off-host URL alone silently fails to resolve.
+      #
+      # Both are documented override patterns, not baked defaults -- README,
+      # "Optional webhook", has both files. The committed dispatcher reaches the
+      # bridge and the socket-proxy and nothing else.
+      EMAIL_GUARD_WEBHOOK_URL: "${EMAIL_GUARD_WEBHOOK_URL:-}"
 
     volumes:
       - email-guard-data:/app/data

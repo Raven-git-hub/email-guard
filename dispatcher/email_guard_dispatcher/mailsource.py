@@ -59,6 +59,17 @@ class MailSource(Protocol):
     def fetch_new(self) -> list[tuple[str, bytes]]:
         """Return ``(uid, raw_rfc822_bytes)`` for every message awaiting a scan."""
 
+    def fetch_all(self) -> list[tuple[str, bytes]]:
+        """Return ``(uid, raw_rfc822_bytes)`` for *every* message in the mailbox.
+
+        The re-scan half. Where :meth:`fetch_new` asks the server what is
+        unread, this asks for the whole mailbox and lets the caller decide what
+        to do with it -- which is the only way to reach mail that was read, or
+        filed, or processed under an older ruleset. Nothing here consults the
+        processed-state file; that filter lives in the runner, and the re-scan
+        pass deliberately does not apply it.
+        """
+
     def mark_processed(self, uid: str) -> None:
         """Mark one message handled, so it is not served again."""
 
@@ -170,9 +181,22 @@ class ImapMailSource:
         return self._uid_validity
 
     def fetch_new(self) -> list[tuple[str, bytes]]:
+        return self._search_and_fetch("UNSEEN")
+
+    def fetch_all(self) -> list[tuple[str, bytes]]:
+        """``SEARCH ALL``: the whole mailbox, read and unread alike.
+
+        Used only by the one-shot re-scan. It costs a full download of the
+        mailbox, which is exactly what it is for -- and it is still
+        ``BODY.PEEK``, so enumerating a mailbox this way does not mark anything
+        read behind the operator's back.
+        """
+        return self._search_and_fetch("ALL")
+
+    def _search_and_fetch(self, criterion: str) -> list[tuple[str, bytes]]:
         conn = self._require_conn()
-        typ, data = conn.uid("SEARCH", None, "UNSEEN")
-        self._check(typ, data, what="SEARCH UNSEEN")
+        typ, data = conn.uid("SEARCH", None, criterion)
+        self._check(typ, data, what=f"SEARCH {criterion}")
         uids = (data[0] or b"").split()
 
         messages: list[tuple[str, bytes]] = []
@@ -365,6 +389,15 @@ class FakeMailSource:
             self.fail_times -= 1
             raise MailSourceError("simulated transient IMAP failure")
         return [(uid, raw) for uid, raw in self._messages if uid not in self.seen]
+
+    def fetch_all(self) -> list[tuple[str, bytes]]:
+        """Everything, ``\\Seen`` or not -- the fake's half of ``SEARCH ALL``.
+
+        Note what it does *not* consult: ``self.seen``. That is the whole
+        difference from :meth:`fetch_new`, and it is what lets a test show the
+        re-scan reaching messages an ordinary drain would never be served.
+        """
+        return list(self._messages)
 
     def mark_processed(self, uid: str) -> None:
         self.seen.add(uid)

@@ -2,11 +2,26 @@
 
     python -m email_guard_dispatcher            # poll until stopped
     python -m email_guard_dispatcher --once     # drain what is unread, exit
+    python -m email_guard_dispatcher --rescan   # scan the WHOLE mailbox, exit
     python -m email_guard_dispatcher --verbose  # one line per message
 
 ``--once`` is the first-live-run and cron mode: it drains the messages that are
 UNSEEN right now and exits with 0 if every one of them scanned, 1 if any had to
 be quarantined.
+
+``--rescan`` is the onboarding mode, and it is a **one-shot to run while the
+live dispatcher is stopped**. It scans every message in the mailbox --
+``SEARCH ALL``, so ``\\Seen`` and the processed-state watermark are both
+irrelevant -- and re-files each report into its bucket and re-stages its review
+candidate exactly as a drain does. It writes no state of its own: nothing is
+added to the done-list, nothing is flagged ``\\Seen``, nothing is quarantined,
+so the live loop resumes afterwards with the semantics it had before. Webhooks
+stay silent unless ``--emit-webhooks`` asks for them, which is how a recognised,
+tagged backlog gets injected into a downstream. ``--limit N`` trims the pass to
+the first N messages for a trial run.
+
+The three modes are mutually exclusive: ``--once`` drains, ``--rescan``
+re-scans, and neither one enters the IDLE loop.
 """
 
 from __future__ import annotations
@@ -35,10 +50,39 @@ def build_parser() -> argparse.ArgumentParser:
         prog="email_guard_dispatcher",
         description="Pull new mail from the Proton bridge and scan each message.",
     )
-    parser.add_argument(
+    # argparse enforces the exclusivity, so `--once --rescan` exits 2 with a
+    # usage error rather than silently picking one. Neither flag enters the
+    # IDLE loop, which is the third, default mode.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--once",
         action="store_true",
         help="drain the currently-unread messages once and exit",
+    )
+    mode.add_argument(
+        "--rescan",
+        action="store_true",
+        help=(
+            "one-shot: scan EVERY message in the mailbox (ignoring \\Seen and the "
+            "processed-state watermark), re-file the reports and re-stage review "
+            "candidates, then exit. Writes no dispatcher state. Run it with the "
+            "live dispatcher stopped."
+        ),
+    )
+    parser.add_argument(
+        "--emit-webhooks",
+        action="store_true",
+        help=(
+            "--rescan only: also fire the configured webhook for each message, "
+            "to inject the recognised backlog into a downstream. Off by default, "
+            "so a plain --rescan re-sorts locally and notifies nothing."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="--rescan only: stop after N messages (a trial subset)",
     )
     parser.add_argument(
         "--verbose",
@@ -53,8 +97,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse and cross-check. Exits 2 with a usage message on a bad combination.
+
+    ``--emit-webhooks`` and ``--limit`` are refused outside ``--rescan`` rather
+    than ignored. Both would otherwise read as promises the other modes do not
+    keep: a drain already fires the configured webhook, and it has no notion of
+    a subset at all.
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.emit_webhooks and not args.rescan:
+        parser.error("--emit-webhooks only applies to --rescan (a drain always emits)")
+    if args.limit is not None:
+        if not args.rescan:
+            parser.error("--limit only applies to --rescan")
+        if args.limit < 1:
+            parser.error(f"--limit must be at least 1, got {args.limit}")
+    return args
+
+
+def webhook_url_for(args: argparse.Namespace, settings) -> str | None:
+    """Which webhook URL the sinks should be built from, for this invocation.
+
+    A re-scan is opt-in: re-sorting a mailbox locally must not, by itself,
+    replay months of mail into someone's automation. Every other mode delivers
+    as configured.
+    """
+    if args.rescan and not args.emit_webhooks:
+        return None
+    return settings.webhook_url
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     _configure_logging(args.verbose)
 
     try:
@@ -82,18 +159,27 @@ def main(argv: list[str] | None = None) -> int:
     # accumulate across restarts, each still holding its memory and pid quota.
     _reap_orphans(scanner)
 
+    webhook_url = webhook_url_for(args, settings)
+    if args.rescan and settings.webhook_url and not webhook_url:
+        log.info(
+            "rescan: webhook emission is OFF (pass --emit-webhooks to deliver "
+            "this backlog downstream)"
+        )
+
     source = ImapMailSource(settings.imap)
     runner = Runner(
         source=source,
         scanner=scanner,
         state=state,
-        sinks=build_sinks(settings.webhook_url),
+        sinks=build_sinks(webhook_url),
         max_attempts=settings.imap.max_attempts,
         concurrency=settings.imap.concurrency,
         poll_interval_seconds=settings.imap.poll_interval_seconds,
     )
 
     try:
+        if args.rescan:
+            return _rescan(runner, source, limit=args.limit, verbose=args.verbose)
         if args.once:
             return _drain_once(runner, source, verbose=args.verbose)
         _run_forever(runner)
@@ -132,6 +218,26 @@ def _drain_once(runner: Runner, source, verbose: bool) -> int:
     if verbose and report.results:
         print(describe(report.results))
     return EXIT_ERROR if report.quarantined else EXIT_OK
+
+
+def _rescan(runner: Runner, source, limit: int | None, verbose: bool) -> int:
+    """The onboarding pass. Exits non-zero if any message could not be scanned.
+
+    Unlike ``--once`` a failure here is not quarantined -- the re-scan writes no
+    state -- so the exit code is the only durable record of one. The per-message
+    error is on stderr, and the message is still sitting in the mailbox to try
+    again.
+    """
+    source.connect()
+    log.info(
+        "rescan: one-shot pass over the whole mailbox; no dispatcher state is "
+        "written and nothing is marked \\Seen. The live dispatcher should be stopped."
+    )
+    report = runner.rescan(limit=limit)
+    print(f"rescan: {report.summary()}")
+    if verbose and report.results:
+        print(describe(report.results))
+    return EXIT_ERROR if report.failed else EXIT_OK
 
 
 def _run_forever(runner: Runner) -> None:

@@ -59,7 +59,7 @@ The rules pack contains:
 | Source cleaners (Outlook / Gmail / Proton) | Provided; contracts to be standardised |
 | Triage / initial level assignment | Exists; greylist matching to be updated to current schema |
 | Signature reference DB (`rules/reference/`) | **Scaffolded** — injection feed seeded, phishing feed empty by design; static loader that fails open. Interval-pulling from git not built |
-| Dispatcher (bridge IMAP → scanner) | **Built** — on-arrival via IMAP `IDLE`, with the poll loop kept as the correctness backstop. Two scanner runners behind one interface: subprocess (dev) and one hardened container per message (deployed) |
+| Dispatcher (bridge IMAP → scanner) | **Built** — on-arrival via IMAP `IDLE`, with the poll loop kept as the correctness backstop. Two scanner runners behind one interface: subprocess (dev) and one hardened container per message (deployed). Plus `--rescan`, the one-shot onboarding pass over an entire existing mailbox |
 | Per-message scanner container | **Built, unvalidated on a host** — `scanner/Dockerfile` plus `ContainerRunner`: `docker run --rm`, no network, read-only root, non-root, caps dropped, memory/pid/cpu bounded, Docker reached via a socket-proxy. Built where no Docker daemon exists, so the container path has never actually run — see `VALIDATION.md` |
 | Canary (local LLM) semantic checks | **To be built** |
 | Routing / outbound store | **Built** — every scan lands in `outbound/<bucket>/<job>/` (report + original) |
@@ -596,7 +596,8 @@ python -m email_guard_dispatcher            # IDLE, and a full drain at least ev
 > The converse also matters: **a message already marked `\Seen` by another client is never
 > scanned.** That is fine for the intended setup — a dedicated intake mailbox that no human
 > reads — but it means the dispatcher is not safe to point at a mailbox you browse yourself,
-> because anything you open first will be skipped.
+> because anything you open first will be skipped. `--rescan` is the way to reach that mail,
+> and the way to onboard an existing inbox — see "Re-scanning the whole mailbox" below.
 
 ### What it does with each message
 
@@ -619,12 +620,109 @@ can clear a flag, and quarantined messages are recorded there too so a cleared f
 replay a known-bad message. Both it and `data/dispatcher/quarantine.log` name real
 correspondents, so both are git-ignored.
 
+### Re-scanning the whole mailbox (onboarding)
+
+The live loop only ever sees what is unread. `--rescan` is the one-shot that sees everything:
+
+```sh
+python -m email_guard_dispatcher --rescan --limit 20 --verbose   # trial subset first
+python -m email_guard_dispatcher --rescan                        # the whole mailbox
+python -m email_guard_dispatcher --rescan --emit-webhooks        # ...and notify downstream
+```
+
+It finds work with `SEARCH ALL` rather than `SEARCH UNSEEN`, by UID, so **both** of the
+filters the live loop depends on are bypassed: the `\Seen` flag is irrelevant, and so is the
+processed-state watermark in `data/dispatcher/state.json`. Every message goes through the
+configured scanner runner — the hardened container in production, same as any other scan —
+and each report is re-filed into `outbound/<bucket>/<job>/` and each review candidate
+re-staged, exactly as a normal drain does. There is no special re-filing path; the scanner
+writes those keyed by message id on every run, so re-scanning *is* re-sorting.
+
+> **Run it with the live dispatcher stopped.** It is a one-shot, not a second worker. Two
+> processes scanning the same mailbox would fire each other's webhooks and race on the
+> scanner's output directories.
+
+What it deliberately does **not** do is touch the live loop's state semantics. It records
+nothing in the state file, marks nothing `\Seen`, and quarantines nothing — a scan failure is
+logged, counted, and reflected in the exit code, and the message is left exactly where it was
+for the live loop to handle properly. Stop the dispatcher, re-scan, start it again, and the
+done-list means precisely what it meant before.
+
+| flag | effect |
+| --- | --- |
+| `--rescan` | scan every message; re-file and re-stage locally; **fire no webhooks** |
+| `--emit-webhooks` | also POST each verdict to the configured sink — the onboarding injection |
+| `--limit N` | stop after N messages, for a trial run |
+| `--verbose` | one line per message at the end, on top of the running progress log |
+
+Webhook emission is off by default because a plain re-sort must not, by itself, replay months
+of mail into someone's automation. Turning it on is how the **recognised, tagged backlog**
+gets injected into a downstream (n8n) as onboarding — the whole inbox arrives already scored,
+bucketed and tagged, rather than the downstream starting from empty.
+
+Expect it to be slow: one hardened container per message over a full inbox is a long job, and
+the pass is sequential on purpose so the progress count only goes up and deliveries reach the
+downstream in mailbox order. Progress is logged per message, and the run ends with a summary:
+
+```
+rescan: mailbox=2841 scanned=2839 failed=2 cleared=2103 flagged=684 rejected=52 candidates=97
+```
+
+`--rescan` and `--once` are mutually exclusive, and neither enters the IDLE loop.
+`--emit-webhooks` and `--limit` are refused outside `--rescan` rather than quietly ignored.
+
 ### Optional webhook
 
 Set `dispatcher.webhook_url` in `config/config.json` or `EMAIL_GUARD_WEBHOOK_URL` in the
 environment and each verdict is POSTed as JSON, with a short retry and backoff. With no URL
 set, the default sink just logs the verdict. Delivery is currently best-effort — a durable
 retry queue is still to come.
+
+Under compose the variable is passed through to the dispatcher (`"${EMAIL_GUARD_WEBHOOK_URL:-}"`),
+so it is set in `.env` and nothing tracked changes. **Which URL works depends on where the
+downstream runs, and the answer is usually not the address you would type into a browser.**
+
+**(a) The target runs on this host** — n8n in its own compose stack, say. Reach it over *that
+service's* docker network, by service name, on its *internal* port:
+
+```sh
+# .env
+EMAIL_GUARD_WEBHOOK_URL=http://n8n:5678/webhook/email-guard
+```
+
+```yaml
+# docker-compose.override.yml -- attach the dispatcher to n8n's network
+services:
+  dispatcher:
+    networks: [mail, dockerproxy, n8n]
+networks:
+  n8n:
+    external: true
+    name: n8n_default        # `docker network ls` for the real name
+```
+
+Using the public hostname instead sends the POST out of the host and back in through the
+edge, for a service that is two containers away. That round-trip is pure cost, and it puts
+the delivery in front of whatever bot filter the edge runs: **Cloudflare answers a bare
+container-issued POST with `error 1010`**, and the event is lost behind a 403-shaped log line
+that says nothing about why. The internal URL avoids both.
+
+**(b) The target runs somewhere else** — then it does need a public URL, *and* the dispatcher
+needs egress, which it does not have:
+
+```yaml
+# docker-compose.override.yml
+services:
+  dispatcher:
+    networks: [mail, dockerproxy, egress]
+```
+
+Without that the dispatcher is on `mail` and `dockerproxy` only, both `internal: true`, so an
+off-host URL fails to resolve rather than failing to authenticate.
+
+Both are **override patterns, not defaults**. The committed dispatcher reaches the bridge and
+the socket-proxy and nothing else; giving the process that handles hostile mail a route off
+the host is a decision to make deliberately, in a file that is not tracked.
 
 ---
 
@@ -861,7 +959,7 @@ The console is one service in the full stack:
 ```
 cp .env.sample .env && $EDITOR .env       # required paths and credentials
 docker compose --profile build build scanner
-docker compose build dispatcher webui
+docker compose build bridge dispatcher webui
 docker compose up -d                       # bridge + dispatcher + socket-proxy + webui
 ```
 
@@ -886,6 +984,24 @@ and nothing tracked to edit. Two things to know before the first `up`:
 - **The bridge service reuses your existing, already-logged-in Proton Bridge** via
   `EMAIL_GUARD_BRIDGE_CONFIG_DIR`. It does not initialise a new one, and pointing it at an
   empty directory forces the whole account-login and keychain dance again.
+
+#### The bridge is built here, not pulled
+
+`bridge/Dockerfile` is three lines on top of `shenxn/protonmail-bridge:latest`, and it exists
+because that image **updates the bridge binary inside the running container**. The build
+Proton now ships links against `libfido2.so.1`, which the image does not carry, so the next
+restart after that self-update dies at launch with:
+
+```
+error while loading shared libraries: libfido2.so.1: cannot open shared object file
+```
+
+Nothing in this repository changes; the stack simply stops working one day. And the symptom
+lands somewhere else entirely — the bridge restart-loops, never opens its IMAP listener, and
+the *dispatcher* logs `EOF` or connection-refused against `bridge:143` forever, which reads
+as a dispatcher fault. The Dockerfile installs `libfido2-1`, so `docker compose build bridge`
+and `up` give a bridge that survives its own auto-updates. Pinning an older base tag would
+only trade this for a bridge that eventually cannot authenticate against Proton.
 
 The bridge sits on two networks: the `internal: true` `mail` network it shares with the
 dispatcher, and a second `egress` network it needs to reach Proton at all — without egress it

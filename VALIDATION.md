@@ -86,12 +86,22 @@ skip the hostname check"; it is tracked as `TODO(bridge-tls)` in
 
 ---
 
-## 2. Build both images
+## 2. Build the images
 
 ```sh
-docker compose build dispatcher webui
+docker compose build bridge dispatcher webui
 docker compose --profile build build scanner
 ```
+
+**`bridge` is built here, not pulled, and that is a fix rather than a
+preference.** `shenxn/protonmail-bridge` updates the bridge binary *inside the
+running container*, and the build Proton now ships needs `libfido2.so.1`, which
+that image does not carry. The next restart after the self-update then fails
+with `error while loading shared libraries: libfido2.so.1`, the IMAP listener
+never opens, and the failure surfaces at the far end as a dispatcher stuck on
+`EOF` against `bridge:143` — see the diagnosis section, which is where you will
+actually meet this. `bridge/Dockerfile` installs `libfido2-1` on top of the
+upstream image so a clean build-and-up survives the next auto-update too.
 
 The scanner is under a `build` profile because it is never *run* as a service —
 the dispatcher creates its containers directly. Confirm the tag the dispatcher
@@ -250,6 +260,113 @@ which costs latency only, and is worth chasing but is not urgent.
 
 ---
 
+## 7. Optional: onboard the existing mailbox with `--rescan`
+
+Everything above validates the *live* path, which only ever sees unread mail.
+`--rescan` is the one-shot that sorts what is already there — the whole
+mailbox, `\Seen` or not, watermark or not.
+
+**Stop the dispatcher first.** It is a one-shot, not a second worker; two
+processes scanning one mailbox fire each other's webhooks and race on the
+scanner's output directories.
+
+```sh
+docker compose stop dispatcher
+
+# a trial subset, no webhooks, one container per message
+docker compose run --rm dispatcher python -m email_guard_dispatcher \
+  --rescan --limit 20 --verbose
+```
+
+Watch the progress lines (`rescan 7/20: uid=... level=3 bucket=flagged`) and
+read the summary at the end:
+
+```
+rescan: mailbox=2841 scanned=20 failed=0 cleared=14 flagged=5 rejected=1 candidates=3 (limit=20)
+```
+
+Then confirm on the host that it re-filed and re-staged exactly as a drain
+does, and — the part worth checking deliberately — that it disturbed **nothing**:
+
+```sh
+find data/outbound -newermt '-10 minutes' -name report.json | wc -l   # ~20
+find data/daily-brief -newermt '-10 minutes' -name candidate.json | wc -l
+sha256sum data/dispatcher/state.json    # unchanged by the re-scan
+```
+
+The state file must be byte-identical afterwards. A re-scan records nothing in
+the done-list, marks nothing `\Seen` and quarantines nothing — so when the
+dispatcher is started again it resumes with the semantics it had before, and
+mail that was unread is still unread and still waiting for it.
+
+Drop `--limit` for the full pass, and expect it to take a long time: one
+hardened container per message, sequential. Add `--emit-webhooks` to also POST
+each verdict, which is how the recognised, tagged backlog gets injected into a
+downstream as onboarding — read the next section before doing that, because the
+URL that works is usually not the obvious one.
+
+```sh
+docker compose start dispatcher      # back to the live loop
+```
+
+---
+
+## 8. Optional: webhook delivery
+
+`EMAIL_GUARD_WEBHOOK_URL` in `.env` is passed through to the dispatcher
+(`"${EMAIL_GUARD_WEBHOOK_URL:-}"`). Unset, no webhook sink is built at all and
+the dispatcher stays egress-free — which is the committed default and the right
+one for a process that handles hostile mail.
+
+**(a) The target runs on this host** (n8n, typically). Reach it over *that
+service's* docker network, by service name, on its *internal* port —
+`http://n8n:5678/webhook/...` — and attach the dispatcher to that network with
+an override:
+
+```yaml
+# docker-compose.override.yml
+services:
+  dispatcher:
+    networks: [mail, dockerproxy, n8n]
+networks:
+  n8n:
+    external: true
+    name: n8n_default        # `docker network ls` for the real name
+```
+
+Verify the hop before trusting it:
+
+```sh
+docker compose exec dispatcher python -c \
+  "import socket;socket.create_connection(('n8n',5678),5);print('reachable')"
+```
+
+Pointing at the *public* hostname instead sends the POST out of the host and
+back in through the edge, for a service two containers away — and puts the
+delivery in front of whatever bot filter the edge runs. **Cloudflare answers a
+bare container-issued POST with `error 1010`**, which the sink logs as an HTTP
+failure that says nothing about why, and the event is dropped after its
+retries. If webhook attempts fail with a 403 and the target works fine from a
+browser, this is what happened.
+
+**(b) The target is off-host.** Then it needs a public URL *and* egress, which
+the dispatcher does not have:
+
+```yaml
+# docker-compose.override.yml
+services:
+  dispatcher:
+    networks: [mail, dockerproxy, egress]
+```
+
+Without it the dispatcher is on two `internal: true` networks only, so an
+off-host URL fails DNS rather than failing to authenticate.
+
+Both are override patterns and neither is committed: giving the dispatcher a
+route off the host is a deliberate decision, made in a file that is not tracked.
+
+---
+
 ## Diagnosis
 
 ### The socket-proxy allow-list is too short
@@ -333,6 +450,18 @@ the bridge, not the dispatcher:
 
 ```sh
 docker compose logs bridge | grep -i "proton\|lookup\|login\|listen"
+```
+
+`error while loading shared libraries: libfido2.so.1` means the bridge
+auto-updated itself into a binary the base image cannot run. This is the one
+failure here that appears without anything changing on your side, and it will
+recur — the update happens inside the container. The fix is the committed
+`bridge/Dockerfile`; if the bridge service is still running the upstream image
+directly, rebuild it:
+
+```sh
+docker compose build bridge && docker compose up -d bridge
+docker compose exec bridge ldconfig -p | grep -c libfido2   # expect 1 or more
 ```
 
 `lookup mail-api.proton.me ... server misbehaving` means the bridge has no
@@ -422,6 +551,14 @@ Even a clean run of this runbook leaves these untested by anything in the repo:
   IDLE against the real bridge, and whether the bridge drops it in ways the
   reconnect path handles gracefully.
 - **A large first drain**: one container per message, in sequence — materially
-  slower than the subprocess path. Expected, not a fault.
+  slower than the subprocess path. Expected, not a fault. The same applies to
+  `--rescan` over a real inbox, at a much larger multiple.
+- **The bridge's `libfido2` fix under an actual auto-update.** The library is
+  installed and the image builds, but the sequence that matters — bridge
+  self-updates, container restarts, IMAP comes back — only plays out over days
+  on a live host.
+- **Webhook delivery over a real network**, in either pattern. The
+  `error 1010` case above is a live-run finding, not something the suite can
+  reproduce.
 - Rootless Docker, Docker Desktop, and SELinux-enforcing hosts (which may
   require `:z` / `:Z` on the bind mounts).

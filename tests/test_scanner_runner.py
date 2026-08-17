@@ -321,6 +321,49 @@ def test_the_dispatcher_uses_the_container_network_imap_port():
     assert port == "${EMAIL_GUARD_IMAP_PORT:-143}"
 
 
+def test_the_bridge_is_built_locally_so_it_survives_its_own_auto_update():
+    """`shenxn/protonmail-bridge` updates the bridge binary inside the container.
+
+    The build it now pulls links against `libfido2.so.1`, which that image does
+    not ship, so the bridge dies at launch on the next restart -- and the
+    symptom is a dispatcher getting EOF from `bridge:143`, which looks like a
+    dispatcher fault and is not one. Reverting to `image:` would reintroduce a
+    stack that breaks itself with no local change at all.
+    """
+    bridge = _compose()["services"]["bridge"]
+
+    assert bridge.get("build") == "./bridge", "the bridge must be built, not pulled"
+    assert bridge["image"] == "email-guard-bridge:0.1.0"
+
+    dockerfile = (DISPATCHER_PACKAGE.parents[1] / "bridge" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert "FROM shenxn/protonmail-bridge" in dockerfile
+    assert "libfido2-1" in dockerfile
+
+
+def test_the_dispatcher_takes_a_webhook_url_from_the_environment():
+    """Passthrough only: unset means no webhook sink is built and no egress.
+
+    The URL cannot be baked in -- it names a downstream this repo knows nothing
+    about -- but it has to be *reachable* from compose, or the deployed
+    dispatcher can never deliver anything however it is configured.
+    """
+    environment = _compose()["services"]["dispatcher"]["environment"]
+
+    assert environment["EMAIL_GUARD_WEBHOOK_URL"] == "${EMAIL_GUARD_WEBHOOK_URL:-}"
+    assert load({}).webhook_url is None  # absent from the environment: no sink
+
+
+def test_the_webhook_url_is_documented_in_the_env_sample():
+    """Both delivery patterns, in the file an operator actually edits."""
+    sample = (DISPATCHER_PACKAGE.parents[1] / ".env.sample").read_text(encoding="utf-8")
+
+    assert "EMAIL_GUARD_WEBHOOK_URL" in sample
+    assert "1010" in sample, "the Cloudflare bot-filter failure mode is the point"
+    assert "egress" in sample
+
+
 def test_the_socket_proxy_can_write_its_own_config():
     """haproxy renders /tmp/haproxy.cfg at startup; read_only alone crash-loops."""
     proxy = _compose()["services"]["docker-socket-proxy"]

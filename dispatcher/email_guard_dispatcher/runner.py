@@ -42,6 +42,15 @@ log = logging.getLogger(__name__)
 
 PROCESSED = "processed"
 QUARANTINED = "quarantined"
+# The re-scan's failure status. Deliberately not QUARANTINED: quarantining
+# writes the uid into the state file, and the re-scan writes nothing there.
+FAILED = "failed"
+
+# The scanner's bucket vocabulary, duplicated rather than imported -- the
+# dispatcher imports nothing from ``email_guard`` (see the test that pins it),
+# and this is only used to order a summary line. A bucket that is not in this
+# tuple still gets counted; it is just reported after these three.
+BUCKETS = ("cleared", "flagged", "rejected")
 
 INITIAL_RECONNECT_BACKOFF = 2.0
 MAX_RECONNECT_BACKOFF = 300.0
@@ -89,6 +98,56 @@ class DrainReport:
             f"fetched={self.fetched} scanned={len(self.processed)} "
             f"quarantined={len(self.quarantined)} already-done={self.skipped}"
         )
+
+
+@dataclass
+class RescanReport:
+    """What the one-shot re-scan did.
+
+    Reported per *bucket* rather than per status, because the point of a
+    re-scan is the sort: an operator wants to know how the backlog broke down,
+    and how many of it came back needing a human.
+    """
+
+    fetched: int = 0
+    limit: int | None = None
+    results: list[MessageResult] = field(default_factory=list)
+
+    @property
+    def processed(self) -> list[MessageResult]:
+        return [r for r in self.results if r.status == PROCESSED]
+
+    @property
+    def failed(self) -> list[MessageResult]:
+        return [r for r in self.results if r.status != PROCESSED]
+
+    @property
+    def bucket_counts(self) -> dict[str, int]:
+        """Every bucket the pass produced, the three known ones always present."""
+        counts = {name: 0 for name in BUCKETS}
+        for result in self.processed:
+            bucket = result.bucket or "unknown"
+            counts[bucket] = counts.get(bucket, 0) + 1
+        return counts
+
+    @property
+    def candidates(self) -> int:
+        """How many messages the scanner staged for the review console."""
+        return sum(
+            1
+            for result in self.processed
+            if ((result.verdict or {}).get("written") or {}).get("candidate")
+        )
+
+    def summary(self) -> str:
+        counts = self.bucket_counts
+        ordered = list(BUCKETS) + sorted(set(counts) - set(BUCKETS))
+        buckets = " ".join(f"{name}={counts[name]}" for name in ordered)
+        line = (
+            f"mailbox={self.fetched} scanned={len(self.processed)} "
+            f"failed={len(self.failed)} {buckets} candidates={self.candidates}"
+        )
+        return f"{line} (limit={self.limit})" if self.limit is not None else line
 
 
 class Runner:
@@ -144,6 +203,90 @@ class Runner:
             attempts, outcome = scanned[uid]
             report.results.append(self._commit(uid_validity, uid, attempts, outcome))
         return report
+
+    # -- the one-shot re-scan -------------------------------------------------
+
+    def rescan(self, limit: int | None = None) -> RescanReport:
+        """Run every message in the mailbox through the scanner, once.
+
+        The onboarding pass. It differs from :meth:`drain_once` in exactly
+        three ways, and each is deliberate:
+
+        * **It asks for everything.** ``fetch_all`` is ``SEARCH ALL``, so
+          ``\\Seen`` is irrelevant -- read mail, filed mail and mail that
+          arrived before this tool existed are all in scope.
+        * **It ignores the watermark.** The processed-state file is never
+          consulted, so a uid the live loop finished with last week is scanned
+          again regardless.
+        * **It writes no state at all.** No ``state.add``, no
+          ``state.quarantine``, no ``\\Seen`` flag set. The live loop's
+          done-list means precisely what it meant before this ran, and a
+          message that was unread stays unread.
+
+        That last point is what makes the mode safe to offer, and also why it
+        is a one-shot to run *while the dispatcher is stopped*: two processes
+        scanning the same mailbox would each fire the other's webhooks and race
+        on the scanner's output directories. Nothing enforces that -- it is an
+        operational instruction, and it is in the README and in ``--help``.
+
+        Re-filing is not a special case here: the scanner writes
+        ``outbound/<bucket>/<job>/`` and stages the review candidate itself, on
+        every run, keyed by message id. A re-scan therefore re-sorts and
+        re-stages by doing nothing more than scanning again.
+
+        Sequential on purpose, where the drain uses a pool: a full inbox at one
+        hardened container per message is a long job, and an operator watching
+        it wants a progress count that only goes up and webhook deliveries that
+        arrive in mailbox order. The parallelism is worth more on the live
+        path, where latency is the whole point.
+        """
+        messages = list(self.source.fetch_all())
+        report = RescanReport(fetched=len(messages), limit=limit)
+        if limit is not None:
+            messages = messages[: max(0, limit)]
+
+        total = len(messages)
+        log.info("rescan: %s message(s) to scan of %s in the mailbox", total, report.fetched)
+        for index, (uid, raw) in enumerate(messages, start=1):
+            attempts, outcome = self._scan_with_retries(uid, raw)
+            result = self._observe(uid, attempts, outcome)
+            report.results.append(result)
+            if result.status == PROCESSED:
+                log.info(
+                    "rescan %s/%s: uid=%s level=%s bucket=%s",
+                    index,
+                    total,
+                    uid,
+                    result.final_level,
+                    result.bucket,
+                )
+            else:
+                log.error(
+                    "rescan %s/%s: uid=%s FAILED after %s attempts: %s",
+                    index,
+                    total,
+                    uid,
+                    attempts,
+                    result.error,
+                )
+        return report
+
+    def _observe(self, uid: str, attempts: int, outcome: ScanOutcome) -> MessageResult:
+        """:meth:`_commit` without the commits: sinks fire, nothing persists.
+
+        A failure here is recorded in the report and logged, and that is all.
+        Writing it to the quarantine log would also add the uid to the state
+        file -- see :meth:`ProcessedState.quarantine` -- and a re-scan that
+        quietly marked live mail as done would be the one way this mode could
+        cost a message.
+        """
+        if not outcome.ok:
+            return MessageResult(
+                uid=uid, status=FAILED, attempts=attempts, error=outcome.error
+            )
+        verdict = outcome.verdict or {}
+        self._deliver(verdict, uid)
+        return MessageResult(uid=uid, status=PROCESSED, attempts=attempts, verdict=verdict)
 
     def _scan_all(
         self, pending: Sequence[tuple[str, bytes]]
@@ -325,5 +468,8 @@ def describe(results: Iterable[MessageResult]) -> str:
                 f"level={result.final_level} bucket={result.bucket}"
             )
         else:
-            lines.append(f"  uid={result.uid} QUARANTINED after {result.attempts} attempts: {result.error}")
+            lines.append(
+                f"  uid={result.uid} {result.status.upper()} "
+                f"after {result.attempts} attempts: {result.error}"
+            )
     return "\n".join(lines)
