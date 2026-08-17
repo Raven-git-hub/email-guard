@@ -442,7 +442,7 @@ Resolution order, highest first:
 | Marker | Catches |
 |--------|---------|
 | `roleplay_tag` | instruction framing — `system:`, `### Instruction:`, `[INST]:` |
-| `hidden_unicode` | zero-width and BOM characters smuggling text past a human reader |
+| `hidden_unicode` | zero-width and BOM characters **concealing** something — see below |
 | `code_fences` | two or more ` ``` ` fences |
 | `instruction_override` | the canonical prose override — `ignore`/`disregard` + `(all)? (the)? previous/prior/earlier/above/foregoing` + `instructions/prompts/directions/rules/commands` |
 
@@ -461,6 +461,46 @@ Both halves are held to the same precision bar, against one shared false-positiv
 `tests/conftest.py`. `instruction_override` requires the instruction-shaped object for the
 same reason the feed seeds do: "please disregard the previous **email**" is a routine
 correction notice, "disregard the previous **instructions**" is not.
+
+#### `hidden_unicode`: concealment, not merely invisibility
+
+The marker used to be a character census — *any* U+200B/200C/200D/FEFF anywhere in the title
+or body was a level-1 reject. Because the floor runs ahead of the lists, that rejected
+greylisted and whitelisted senders alike, and mail templates emit zero-width padding as a
+matter of course: it was the engine's largest single source of over-rejection (a 300-message
+rescan cleared ~12%, with this marker a primary driver — Standard Chartered, HSBC,
+`store-news@amazon`, Glassdoor, Suno and Telekom among the victims).
+
+The ordering was never the bug — a trusted sender's account can be compromised, so injection
+detection must not be bypassable by list membership. The **detection** is what became
+precise. Two shapes now fire, and nothing else does:
+
+| Shape | Example | Why |
+|-------|---------|-----|
+| a zero-width run **inside a word** | `ig<zw>nore pre<zw>vious` | splits the word for every keyword and phrase matcher downstream while reading identically to a human |
+| a run that **hides phrasing** | `ignore all<zw> previous instructions` | stripping the characters makes a floor marker appear that the text as it stands does not match — here the override pattern's `\s+` |
+
+When stripping reveals a marker, that marker is named alongside `hidden_unicode`, so the
+reason reads *smuggled, and here is what was smuggled*.
+
+Everything else is padding and raises the level not at all: a run next to whitespace,
+punctuation or a string boundary; scattered spacers; a U+200D joining two emoji into one
+glyph. "Inside a word" is scoped to the scripts the phrase matching actually reads (Latin,
+Greek, Cyrillic, digits), so ZWNJ/ZWJ doing their ordinary orthographic job in Arabic or
+Indic text, and the U+200B that Thai and Khmer use as a word separator, never trip it — a
+split there evades no matcher this engine runs, and injection phrasing hidden in any script
+is still caught by the reveal rule. One residual cost is accepted knowingly: a line-break
+hint inside a single long word (German compound nouns are the usual source) is
+indistinguishable from a one-word split and still fires.
+
+Both directions are pinned in the committed corpus, and neither case means much alone:
+`greylist-zero-width-padding` (a padded receipt that must clear — formerly a `strict` xfail)
+and `injection-zero-width-split-rejected` (an override cut mid-word that must still be
+rejected).
+
+> **This is engine code, not pack data.** `triage.py` ships inside the scanner image, so it
+> does not ride the rules auto-updater: it is live only after `docker compose build scanner`
+> on the host. `VALIDATION.md` §10.7.
 
 > **Interval pulling: built.** Pulling this repository on an interval so signature updates
 > land without a redeploy is the intended operating mode, and is what the fail-open behaviour

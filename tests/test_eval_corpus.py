@@ -11,13 +11,17 @@ Two things it is for:
   greylisted sender must stay cleared, for every user of the shared pack -- not
   just on the operator's machine where the real corpus lives.
 * **it proves the harness reflects reality.** A scorer that agrees with nothing
-  is as useless as one that agrees with everything, so the corpus deliberately
-  contains cases that pass today and one that does not.
+  is as useless as one that agrees with everything, so the corpus pins both
+  directions of every judgement it can.
 
-The zero-width case is that one, and it is a ``strict`` xfail: when the bug is
-fixed it starts passing, the strict marker turns that into a failure, and
-whoever fixed it is told to promote the case to an ordinary guard. An xfail that
-quietly keeps passing is how a regression test stops being one.
+The zero-width pair is the sharpest example. ``greylist-zero-width-padding``
+was a ``strict`` xfail while the hidden-unicode marker fired on any zero-width
+character at all; the precision fix in :mod:`email_guard.triage` made it pass,
+so it now stands as an ordinary guard against the over-rejection coming back.
+``injection-zero-width-split-rejected`` is its opposite number, added with the
+fix: the same character class used to cut an injection phrase mid-word, which
+must still be rejected. Neither case means much without the other -- one alone
+could be satisfied by deleting the marker or by keeping the old blunt one.
 """
 
 from __future__ import annotations
@@ -26,22 +30,14 @@ from pathlib import Path
 
 import pytest
 
-from email_guard.eval import DANGEROUS, Corpus, grade_corpus
+from email_guard.eval import Corpus, grade_corpus
 from email_guard.rulespack import RulesPack
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CORPUS_DIR = PROJECT_ROOT / "tests" / "eval-corpus"
 
-ZERO_WIDTH_CASE = "greylist-zero-width-padding"
-
-# Why this one is expected to fail, in the place a reader hits it first.
-ZERO_WIDTH_REASON = (
-    "the zero-width bug: triage.injection_markers() raises 'hidden_unicode' on "
-    "bare U+200B/U+FEFF padding with no payload beneath it, so a catalogued "
-    "receipt from a greylisted sender is rejected at level 1. When the fix lands "
-    "this xfail becomes an XPASS -- delete the marker and let the case stand as "
-    "an ordinary guard."
-)
+ZERO_WIDTH_PADDING_CASE = "greylist-zero-width-padding"
+ZERO_WIDTH_SPLIT_CASE = "injection-zero-width-split-rejected"
 
 
 @pytest.fixture(scope="module")
@@ -91,10 +87,8 @@ def test_every_committed_case_is_reviewed(corpus: Corpus):
     [
         "phishing-injection-rejected",
         "greylist-receipt-cleared",
-        pytest.param(
-            ZERO_WIDTH_CASE,
-            marks=pytest.mark.xfail(strict=True, reason=ZERO_WIDTH_REASON),
-        ),
+        ZERO_WIDTH_PADDING_CASE,
+        ZERO_WIDTH_SPLIT_CASE,
     ],
 )
 def test_reviewed_case_lands_in_its_expected_bucket(scorecard, case_id: str):
@@ -109,39 +103,47 @@ def test_reviewed_case_lands_in_its_expected_bucket(scorecard, case_id: str):
 def test_the_corpus_has_no_dangerous_false_clears(scorecard):
     """The gate, asserted in the suite as well as at the command line.
 
-    Over-blocking is allowed to fail here -- the zero-width case does -- but
+    Over-blocking is allowed to fail here -- it is advisory, not a breach -- but
     nothing may reach 'cleared' that the corpus says should have been held back.
     """
     assert [result.id for result in scorecard.dangerous] == []
     assert scorecard.clean is True
 
 
-def test_the_known_failure_is_over_blocking_not_a_false_clear(scorecard):
-    """Direction matters more than the failure count.
+def test_the_zero_width_pair_divides_on_concealment_not_on_characters(scorecard):
+    """The fix, stated as the difference between two messages.
 
-    The zero-width bug quarantines a legitimate receipt. That is a nuisance to
-    fix, not a breach, and the harness must classify it that way -- otherwise
-    the exit-code gate fires on a corpus that is behaving as documented.
+    Both bodies carry the same class of invisible character. The padded receipt
+    clears because the characters conceal nothing; the split one is rejected,
+    and its reason names ``hidden_unicode``, because they cut an instruction
+    override into pieces no phrase matcher would see. Asserting the reason and
+    not just the bucket is what stops the split case passing for some unrelated
+    signal -- the sender is on no list and the phrasing is invisible to both the
+    floor's override pattern and the signature feed.
     """
-    result = _result(scorecard, ZERO_WIDTH_CASE)
+    padding = _result(scorecard, ZERO_WIDTH_PADDING_CASE)
+    split = _result(scorecard, ZERO_WIDTH_SPLIT_CASE)
 
-    assert result.passed is False
-    assert result.direction != DANGEROUS
-    assert result.actual_bucket == "rejected"
-    assert "hidden_unicode" in result.reason
+    assert padding.actual_bucket == "cleared" and padding.final_level == 4
+    assert "hidden_unicode" not in padding.reason
+
+    assert split.actual_bucket == "rejected" and split.final_level == 1
+    assert "hidden_unicode" in split.reason
 
 
 def test_the_two_receipt_cases_differ_only_by_invisible_characters():
     """What makes the zero-width case evidence rather than an anecdote.
 
     If the clean receipt and the padded one diverged in any visible way, the
-    padded one's rejection could be blamed on that instead. Stripping the
-    zero-width characters and the message id must leave the same body.
+    padded one's verdict could be blamed on that instead. Stripping the
+    zero-width characters and the message id must leave the same body -- which
+    is also what makes it a live guard now that it clears: only the invisible
+    characters can be responsible for either answer.
     """
     clean = (CORPUS_DIR / "cases" / "greylist-receipt-cleared" / "message.eml").read_text(
         encoding="utf-8"
     )
-    padded = (CORPUS_DIR / "cases" / ZERO_WIDTH_CASE / "message.eml").read_text(
+    padded = (CORPUS_DIR / "cases" / ZERO_WIDTH_PADDING_CASE / "message.eml").read_text(
         encoding="utf-8"
     )
 

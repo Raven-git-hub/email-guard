@@ -86,13 +86,10 @@ from .signatures import SignatureFeed
 
 # Roleplay / instruction framing, e.g. "system:", "### Instruction:", "[INST]:".
 _ROLEPLAY_RE = re.compile(r"(system|user|assistant|instruction|###|\[INST\])\s*:", re.IGNORECASE)
-# Zero-width and BOM characters used to smuggle text past a human reader.
-# Escape form deliberately -- these are invisible when pasted literally.
-_HIDDEN_UNICODE_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 _FENCE_RE = re.compile(r"```")
 # The canonical prose override, mirroring feed seeds inj-0001 and inj-0002.
 #
-# The three markers above are all *structural* -- framing tokens, invisible
+# The other markers are all *structural* -- framing tokens, invisible
 # characters, fenced blocks. Without this one the single most common phrasing
 # of the attack ("ignore all previous instructions") lived only in the feed,
 # so losing the feed reopened exactly the hole rule 2 exists to close: a
@@ -117,24 +114,117 @@ _OVERRIDE_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# hidden_unicode: concealment, not merely invisibility.
+#
+# This marker used to be `re.search("[\u200B-\u200D\uFEFF]")` -- ANY zero-width
+# character anywhere in the title or body was a level-1 reject. That is not a
+# detector, it is a census of a character class, and it was the single largest
+# source of over-rejection in the engine: a 300-message rescan cleared ~12%,
+# with this marker a primary driver. Marketing, banking and receipt templates
+# emit zero-width padding as a matter of course -- Standard Chartered, HSBC,
+# store-news@amazon, Glassdoor, Suno, Telekom were all being thrown out for it.
+#
+# The floor still runs BEFORE the lists, and that ordering is not what was
+# wrong: a trusted sender's account can be compromised, so injection detection
+# must never be bypassable by list membership. The fix is precision, not
+# precedence -- the marker now has to show that the characters are *concealing*
+# something rather than merely being invisible.
+#
+# Two shapes are concealment, and nothing else is:
+#
+#   * a zero-width run INSIDE a word -- "ig<zw>nore pre<zw>vious". Splitting a
+#     word breaks every keyword and phrase matcher downstream while leaving the
+#     text identical to a human, which is the whole attack.
+#   * a zero-width run that HIDES phrasing: stripping the characters makes a
+#     floor marker appear that the text as it stands does not match. "ignore
+#     all<zw> previous instructions" defeats the override pattern's `\s+`
+#     without splitting a single word.
+#
+# Everything else is padding, and padding raises the level not at all: a run
+# next to whitespace, punctuation or a string boundary; scattered spacers; a
+# U+200D joining two emoji into one glyph.
+#
+# "Inside a word" is deliberately scoped to the scripts the phrase matching
+# reads -- Latin, Greek, Cyrillic and digits. Two consequences, both wanted:
+# ZWNJ/ZWJ carrying their ordinary orthographic job in Arabic or Indic text
+# never trips the marker, and neither does the U+200B that Thai and Khmer use
+# as a word separator. A split there evades no matcher we run, and injection
+# phrasing hidden in any script is still caught by the reveal rule above.
+#
+# The residual cost, accepted knowingly: a line-break hint inside one long
+# word (German compound nouns are the usual source) is indistinguishable from a
+# one-word split and still fires. That shape is rare next to the padding this
+# fix admits, and softening it would mean not catching "ig<zw>nore".
+# ---------------------------------------------------------------------------
+
+# Escape form deliberately -- these are invisible when pasted literally.
+_ZERO_WIDTH_CHARS = "\u200B\u200C\u200D\uFEFF"
+_ZERO_WIDTH_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}]")
+# Runs, not single characters: "ig<zw><zw>nore" is one split, not two.
+_ZERO_WIDTH_RUN_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}]+")
+# Latin (incl. accented), Greek, Cyrillic, digits -- see the note above on why
+# the joining scripts are left out rather than special-cased.
+_WORD_CHAR_RE = re.compile("[0-9A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF]")
+
+
 def content_text(message: dict[str, Any]) -> str:
     """The only thing triage is allowed to look at: title + body text."""
     parts = [message.get("title") or "", message.get("clean_text") or ""]
     return "\n".join(part for part in parts if part)
 
 
-def injection_markers(clean_text: str) -> list[str]:
-    """Which hard-baked prompt-injection markers appear in the text."""
-    text = clean_text or ""
+def _visible_markers(text: str) -> list[str]:
+    """The floor markers that read the text as it stands."""
     found: list[str] = []
     if _ROLEPLAY_RE.search(text):
         found.append("roleplay_tag")
-    if _HIDDEN_UNICODE_RE.search(text):
-        found.append("hidden_unicode")
     if len(_FENCE_RE.findall(text)) >= 2:
         found.append("code_fences")
     if _OVERRIDE_RE.search(text):
         found.append("instruction_override")
+    return found
+
+
+def _splits_a_word(text: str) -> bool:
+    """True when a zero-width run sits between two word characters."""
+    for run in _ZERO_WIDTH_RUN_RE.finditer(text):
+        before = text[run.start() - 1 : run.start()] if run.start() else ""
+        after = text[run.end() : run.end() + 1]
+        if _WORD_CHAR_RE.fullmatch(before) and _WORD_CHAR_RE.fullmatch(after):
+            return True
+    return False
+
+
+def zero_width_markers(text: str) -> list[str]:
+    """The markers the text's zero-width characters justify, if any.
+
+    ``[]`` for padding -- which is what zero-width characters almost always
+    are. ``["hidden_unicode", ...]`` when they are concealing: splitting a word
+    run, or hiding phrasing that the floor catches once they are stripped. Any
+    marker the stripping revealed is named alongside, so the reason reads as
+    "smuggled, and here is what was smuggled" rather than just "invisible
+    characters present".
+    """
+    if not _ZERO_WIDTH_RE.search(text):
+        return []
+
+    visible = _visible_markers(text)
+    revealed = [
+        marker
+        for marker in _visible_markers(_ZERO_WIDTH_RE.sub("", text))
+        if marker not in visible
+    ]
+    if not revealed and not _splits_a_word(text):
+        return []
+    return ["hidden_unicode", *revealed]
+
+
+def injection_markers(clean_text: str) -> list[str]:
+    """Which hard-baked prompt-injection markers appear in the text."""
+    text = clean_text or ""
+    found = _visible_markers(text)
+    found.extend(marker for marker in zero_width_markers(text) if marker not in found)
     return found
 
 

@@ -33,6 +33,20 @@ CORPUS_DIR = PROJECT_ROOT / "tests" / "eval-corpus"
 
 CLEAN_RECEIPT = "greylist-receipt-cleared"   # scans to `cleared`
 PHISHING = "phishing-injection-rejected"     # scans to `rejected`
+ZERO_WIDTH_PADDING = "greylist-zero-width-padding"          # scans to `cleared`
+ZERO_WIDTH_SPLIT = "injection-zero-width-split-rejected"    # scans to `rejected`
+GRADED_CASES = 4                             # the committed corpus, all reviewed
+
+# Every case in the committed corpus passes, which is the state a corpus should
+# be kept in -- so the harness tests that need a *failure* to look at make one,
+# by relabelling a case rather than by relying on a broken one being shipped.
+# (The zero-width case used to be that broken one; the triage precision fix
+# turned it into a guard.) Two relabels, named for the direction they produce:
+#
+#   OVER_BLOCK  a message that is rejected, labelled `cleared` -- advisory.
+#   FALSE_CLEAR a message that clears, labelled `rejected` -- dangerous.
+OVER_BLOCK = dict(expected_bucket="cleared", expected_level=None)
+FALSE_CLEAR = dict(expected_bucket="rejected", expected_level=None)
 
 
 @pytest.fixture(scope="module")
@@ -139,28 +153,41 @@ def test_a_false_clear_is_marked_dangerous_end_to_end(corpus_copy, rules_dir, pa
 
 
 def test_over_blocking_alone_leaves_the_run_clean(corpus_copy, rules_dir, pack):
-    """The shipped corpus is this case: one advisory failure, still a pass."""
+    """A failing run that is still a pass: one over-block, no false-clear."""
+    relabel(corpus_copy, PHISHING, **OVER_BLOCK)
+
     scorecard = score(corpus_copy, rules_dir, pack)
 
-    assert scorecard.failures
+    assert [result.id for result in scorecard.failures] == [PHISHING]
     assert not scorecard.dangerous
     assert scorecard.clean is True
 
 
 def test_failures_are_ordered_dangerous_first(corpus_copy, rules_dir, pack):
     """Whatever else is wrong, the false-clear is the line to read first."""
-    relabel(corpus_copy, CLEAN_RECEIPT, expected_bucket="rejected", expected_level=None)
+    relabel(corpus_copy, CLEAN_RECEIPT, **FALSE_CLEAR)
+    relabel(corpus_copy, PHISHING, **OVER_BLOCK)
 
     failures = score(corpus_copy, rules_dir, pack).failures
 
-    assert len(failures) >= 2
+    assert [result.id for result in failures] == [CLEAN_RECEIPT, PHISHING]
     assert failures[0].direction == DANGEROUS
 
 
 # --- the exit-code gate -----------------------------------------------------
 
 
+def test_the_cli_exits_zero_on_a_corpus_that_fully_passes(corpus_copy, rules_dir, capsys):
+    code = eval_cli.main([str(corpus_copy), "--rules-dir", str(rules_dir)])
+
+    assert code == eval_cli.EXIT_OK
+    assert "every graded case landed in its expected bucket" in capsys.readouterr().out
+
+
 def test_the_cli_exits_zero_on_advisory_failures_only(corpus_copy, rules_dir, capsys):
+    """The distinction the gate exists to make: failing, but not dangerously."""
+    relabel(corpus_copy, PHISHING, **OVER_BLOCK)
+
     code = eval_cli.main([str(corpus_copy), "--rules-dir", str(rules_dir)])
 
     assert code == eval_cli.EXIT_OK
@@ -170,7 +197,7 @@ def test_the_cli_exits_zero_on_advisory_failures_only(corpus_copy, rules_dir, ca
 def test_the_cli_exits_nonzero_on_a_dangerous_false_clear(
     corpus_copy, rules_dir, capsys
 ):
-    relabel(corpus_copy, CLEAN_RECEIPT, expected_bucket="rejected", expected_level=None)
+    relabel(corpus_copy, CLEAN_RECEIPT, **FALSE_CLEAR)
 
     code = eval_cli.main([str(corpus_copy), "--rules-dir", str(rules_dir)])
 
@@ -197,11 +224,12 @@ def test_the_cli_writes_the_scorecard_as_json(corpus_copy, rules_dir, tmp_path):
     )
 
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert payload["totals"]["graded"] == 3
+    assert payload["totals"]["graded"] == GRADED_CASES
     assert {case["id"] for case in payload["cases"]} == {
         CLEAN_RECEIPT,
         PHISHING,
-        "greylist-zero-width-padding",
+        ZERO_WIDTH_PADDING,
+        ZERO_WIDTH_SPLIT,
     }
 
 
@@ -209,13 +237,17 @@ def test_the_cli_writes_the_scorecard_as_json(corpus_copy, rules_dir, tmp_path):
 
 
 def test_the_confusion_matrix_counts_every_graded_case(corpus_copy, rules_dir, pack):
+    # One off-diagonal cell on purpose: a matrix that only ever fills its
+    # diagonal cannot show that a miss is counted where the miss happened.
+    relabel(corpus_copy, ZERO_WIDTH_PADDING, expected_bucket="flagged", expected_level=None)
+
     matrix = score(corpus_copy, rules_dir, pack).confusion
 
     total = sum(sum(row.values()) for row in matrix.values())
-    assert total == 3
+    assert total == GRADED_CASES
     assert matrix["cleared"]["cleared"] == 1      # the clean receipt
-    assert matrix["cleared"]["rejected"] == 1     # the zero-width case
-    assert matrix["rejected"]["rejected"] == 1    # the phishing case
+    assert matrix["flagged"]["cleared"] == 1      # the relabelled padding case
+    assert matrix["rejected"]["rejected"] == 2    # phishing, and the split payload
 
 
 def test_the_confusion_matrix_is_dense(corpus_copy, rules_dir, pack):
@@ -234,11 +266,20 @@ def test_the_confusion_matrix_is_dense(corpus_copy, rules_dir, pack):
 def test_a_failure_carries_enough_to_diagnose_without_opening_the_file(
     corpus_copy, rules_dir, pack
 ):
-    result = result_for(score(corpus_copy, rules_dir, pack), "greylist-zero-width-padding")
+    """Levels, deciding stage, deciding list and the engine's own reason.
 
+    The zero-width split case is the one worth reading here: "rejected, not
+    cleared" says nothing on its own, and `hidden_unicode` in the reason is the
+    whole diagnosis.
+    """
+    relabel(corpus_copy, ZERO_WIDTH_SPLIT, **OVER_BLOCK)
+
+    result = result_for(score(corpus_copy, rules_dir, pack), ZERO_WIDTH_SPLIT)
+
+    assert result.passed is False
     assert result.initial_level == 1 and result.final_level == 1
     assert "triage" in result.decided_by
-    assert "greylist" in result.decided_list
+    assert result.decided_list == "no list"
     assert "hidden_unicode" in result.reason
     assert result.forensic_log
 
@@ -294,24 +335,26 @@ def test_the_diff_reports_a_fixed_case(corpus_copy, rules_dir, pack):
 def test_the_diff_keeps_still_failing_separate_from_newly_broken(
     corpus_copy, rules_dir, pack
 ):
-    """The zero-width case fails in both runs; it is not news."""
+    """A case failing in both runs is not news, and must not be reported as it."""
+    relabel(corpus_copy, PHISHING, **OVER_BLOCK)
     baseline = score(corpus_copy, rules_dir, pack).as_dict()
 
     diff = diff_against(baseline, score(corpus_copy, rules_dir, pack))
 
-    assert diff.still_failing == ("greylist-zero-width-padding",)
+    assert diff.still_failing == (PHISHING,)
     assert diff.broken == () and diff.fixed == ()
     assert diff.moved is False
 
 
 def test_a_deleted_case_is_removed_not_fixed(corpus_copy, rules_dir, pack):
-    """Deleting the failing case must not look like fixing it."""
+    """Deleting a failing case must not look like fixing it."""
+    relabel(corpus_copy, PHISHING, **OVER_BLOCK)
     baseline = score(corpus_copy, rules_dir, pack).as_dict()
-    drop(corpus_copy, "greylist-zero-width-padding")
+    drop(corpus_copy, PHISHING)
 
     diff = diff_against(baseline, score(corpus_copy, rules_dir, pack))
 
-    assert diff.removed == ("greylist-zero-width-padding",)
+    assert diff.removed == (PHISHING,)
     assert diff.fixed == ()
 
 
@@ -589,8 +632,8 @@ def test_a_case_that_cannot_be_scanned_fails_rather_than_crashing(
     assert result.passed is False
     assert result.actual_bucket == "error"
     assert "RuntimeError: boom" in (result.error or "")
-    # ...and the other two cases were still graded.
-    assert scorecard.graded == 3
+    # ...and every other case was still graded.
+    assert scorecard.graded == GRADED_CASES
     assert result_for(scorecard, PHISHING).passed
 
 

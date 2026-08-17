@@ -748,6 +748,34 @@ updater pulls the commit, validates that it loads, and promotes it.
 
 Two gates, and they check different things. Neither replaces the other.
 
+### 10.7 Engine changes do **not** ride the auto-updater
+
+§9 promotes the **rules pack** — `rules/`, and the lists. Everything under
+`scanner/` is the engine, it is baked into the scanner image, and a `git push`
+moves it not at all. A change there is live only after a rebuild on the host:
+
+```sh
+# on cerberus
+git pull
+docker compose --profile build build scanner   # or: docker compose build
+```
+
+Nothing needs restarting afterwards — every scan is a fresh container, so the
+next message picks up the new image. See "Updating the scanner" in the README
+for why restarting the dispatcher does nothing.
+
+The trap is that the two look identical from a laptop: tests pass, the push
+succeeds, the updater reports a clean pull — and the behaviour on the host is
+unchanged, because what changed was never in the pack. If a fix does not appear
+live and the tests say it should have, check which side of that line it is on
+before reaching for anything else.
+
+**Known engine changes awaiting a rebuild:**
+
+| Change | Lands in | Needs |
+|--------|----------|-------|
+| `hidden_unicode` precision — zero-width padding no longer rejects, word-internal splits and hidden phrasing still do (`scanner/email_guard/triage.py`) | scanner image | `docker compose build` on cerberus |
+
 ---
 
 ## Diagnosis
