@@ -42,6 +42,14 @@ ENV_PORT = "EMAIL_GUARD_WEBUI_PORT"
 ENV_TOKEN = "EMAIL_GUARD_WEBUI_TOKEN"
 ENV_FRAME_ANCESTORS = "EMAIL_GUARD_WEBUI_FRAME_ANCESTORS"
 ENV_ALLOW_NON_LOOPBACK = "EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK"
+# The one fact this process cannot discover for itself: which HOST interface its
+# port was published on. Inside a container it binds 0.0.0.0 and always has --
+# that is what makes a published port reach it at all -- so its own bind address
+# says nothing about who can connect. `docker-compose.yml` sets this from the
+# same `EMAIL_GUARD_WEBUI_BIND` that decides the publication, which is what lets
+# :func:`reachable_beyond_this_host` tell "loopback-published container" from
+# "console on the LAN". Unset means unknown, and unknown is treated as exposed.
+ENV_PUBLISHED_BIND = "EMAIL_GUARD_WEBUI_PUBLISHED_BIND"
 ENV_SECRETS = "EMAIL_GUARD_SECRETS"
 
 # Where the rules updater's control endpoint lives, and the token for it. The
@@ -181,11 +189,65 @@ def allow_non_loopback(environ: dict[str, str] | None = None) -> bool:
     """Has the operator opted into a non-loopback bind via the environment?
 
     The flag exists for exactly one case: inside a container, where the process
-    must bind ``0.0.0.0`` for a published port to reach it and the *host* side
-    of that publication is pinned to ``127.0.0.1`` (see ``docker-compose.yml``).
+    must bind ``0.0.0.0`` for a published port to reach it. It says the bind is
+    permitted -- NOT that the result is safe. Who can actually connect depends
+    on the host publication, which is :func:`reachable_beyond_this_host`.
     """
     env = os.environ if environ is None else environ
     return str(env.get(ENV_ALLOW_NON_LOOPBACK, "")).strip().lower() in {"1", "true", "yes"}
+
+
+def is_loopback_address(host: str) -> bool:
+    """Is this a host nothing off this machine can reach?
+
+    The same set :attr:`WebUIConfig.is_loopback` uses, applied to an address
+    from the environment rather than to the configured bind.
+    """
+    return str(host).strip().strip("[]").lower() in LOOPBACK_HOSTS
+
+
+def reachable_beyond_this_host(
+    config: "WebUIConfig", environ: dict[str, str] | None = None
+) -> bool:
+    """Can anything other than this machine reach the console?
+
+    **Fail-closed**: this answers True unless it can positively show otherwise.
+    It is what the startup guard keys on, and getting it wrong in the permissive
+    direction means an unauthenticated console -- one that renders
+    attacker-controlled mail and edits the rules deciding what gets delivered --
+    on somebody's LAN.
+
+    Three cases, in the order they are decided:
+
+    * **Bound to loopback.** Nothing off this machine can connect, whatever else
+      is set -- including inside a container, where a loopback bind is precisely
+      what a published port cannot reach. This is the plain ``python -m
+      email_guard_webui`` development path, and it keeps working with no token.
+    * **The publication address is known.** ``EMAIL_GUARD_WEBUI_PUBLISHED_BIND``
+      is set by ``docker-compose.yml`` from ``EMAIL_GUARD_WEBUI_BIND``, so the
+      container is *told* the one thing it cannot observe. A loopback value
+      means the port is published to this host only, and a 0.0.0.0 bind inside
+      the container is then no more reachable than loopback -- which is the
+      whole point of that arrangement.
+    * **Anything else.** A non-loopback bind with no publication information:
+      assume it is reachable. That covers a hand-run ``--allow-non-loopback``,
+      an old compose file against a new image, and every case not thought of.
+
+    Note what this does NOT key on: :func:`allow_non_loopback`. That flag grants
+    *permission* to bind off loopback; the bind itself is the fact. Keying on
+    the flag would refuse a console that had been given the flag and then bound
+    127.0.0.1 anyway -- reachable by nobody, and no reason to stop it.
+    """
+    env = os.environ if environ is None else environ
+
+    if config.is_loopback:
+        return False
+
+    published = str(env.get(ENV_PUBLISHED_BIND, "")).strip()
+    if published:
+        return not is_loopback_address(published)
+
+    return True
 
 
 def _webui_section(path: Path | None) -> dict:

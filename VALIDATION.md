@@ -57,10 +57,18 @@ the host side moves, and the publication stays loopback-only either way.
 
 To reach the console from another machine on the LAN, set
 `EMAIL_GUARD_WEBUI_BIND=0.0.0.0` **and** `EMAIL_GUARD_WEBUI_TOKEN` in the same
-edit — the console reads mail and edits delivery rules over plain HTTP, and
-nothing in the container can enforce that pairing for you. Both stay in `.env`;
-neither is a reason to edit `docker-compose.yml`. Never expose it beyond the
-LAN.
+edit. The pairing is enforced: with the bind off loopback and the token empty,
+the console exits 3 at startup rather than serving mail unauthenticated, and
+the container restart-loops until you fix it. Confirm with:
+
+```sh
+docker compose logs webui | tail -5
+#   refusing to start: the console accepts non-loopback connections but
+#   EMAIL_GUARD_WEBUI_TOKEN is empty; set a token or run loopback-only.
+```
+
+Both variables stay in `.env`; neither is a reason to edit
+`docker-compose.yml`. Never expose it beyond the LAN.
 
 **No override file, no edits to tracked files.** A filled-in `.env` is the
 whole of the configuration; everything else is committed.

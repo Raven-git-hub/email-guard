@@ -1122,15 +1122,42 @@ baked into `docker-compose.yml` rather than left to `.env` precisely so that abs
 configuration is never exposure.
 
 Setting `EMAIL_GUARD_WEBUI_BIND=0.0.0.0` puts the console on the LAN, and **requires
-`EMAIL_GUARD_WEBUI_TOKEN`**. That obligation is an operator's to keep: nothing inside the
-container can see which host interface the port was published on, so no code refuses the
-combination — `.env.sample` states it, and `tests/test_scanner_runner.py` holds the *default*
-to loopback so it cannot regress silently. Do not put the console on the public internet,
-including via a tunnel or a forwarded router port; a shared token answers "other people on my
-LAN", not the internet, and this console has no TLS of its own, no rate limiting and no
-lockout. Reach it from outside over a VPN into the LAN instead.
+`EMAIL_GUARD_WEBUI_TOKEN`** — enforced at startup, not merely asked for. Reachable off this
+host with no token, the console **refuses to start** (exit 3), before anything binds:
 
-Optional shared-token auth guards every `/api/` route: set `EMAIL_GUARD_WEBUI_TOKEN`, or put
+```
+refusing to start: the console accepts non-loopback connections but
+EMAIL_GUARD_WEBUI_TOKEN is empty; set a token or run loopback-only.
+```
+
+The check is fail-closed and lives in `email_guard_webui.config.reachable_beyond_this_host`,
+which answers "reachable" unless it can show otherwise. It decides three cases:
+
+| Bind | Publication | Token | Result |
+|------|-------------|-------|--------|
+| `127.0.0.1` | — | none | starts (nothing off this host can reach it) |
+| `0.0.0.0` | `EMAIL_GUARD_WEBUI_PUBLISHED_BIND=127.0.0.1` | none | starts (the compose default: published to loopback) |
+| `0.0.0.0` | `0.0.0.0`, or **unknown** | none | **refuses** |
+| `0.0.0.0` | anything | set | starts |
+
+That middle row is why a container can be trusted with a `0.0.0.0` bind: it has no way to see
+which *host* interface its port was published on, so `docker-compose.yml` tells it, feeding
+`EMAIL_GUARD_WEBUI_PUBLISHED_BIND` from the same `EMAIL_GUARD_WEBUI_BIND` that decides the
+publication — one variable, so the two cannot drift. Nobody sets that variable by hand. An
+older compose file against a newer image supplies no publication at all, which reads as
+*unknown* and therefore as exposed: it will demand a token. That is the intended failure
+direction.
+
+The token may come from `EMAIL_GUARD_WEBUI_TOKEN` or from `config/secrets.json`; the guard
+reads the resolved config, so either satisfies it.
+
+Do not put the console on the public internet, including via a tunnel or a forwarded router
+port. A shared token answers "other people on my LAN", not the internet, and this console has
+no TLS of its own, no rate limiting and no lockout. Reach it from outside over a VPN into the
+LAN instead.
+
+Shared-token auth guards every `/api/` route — optional on loopback, mandatory off it (see
+above): set `EMAIL_GUARD_WEBUI_TOKEN`, or put
 it in `config/secrets.json` under `webui.token` (git-ignored, like the bridge credentials —
 never in `config.json`, which is committed). Clients present it as `X-Email-Guard-Token`; a
 browser picks it up once from `?token=…`, keeps it in `sessionStorage` and strips it from

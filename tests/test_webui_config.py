@@ -17,7 +17,12 @@ import pytest
 pytest.importorskip("fastapi", reason="the web UI needs the 'webui' extra")
 
 from email_guard_webui import config as webui_config  # noqa: E402
-from email_guard_webui.__main__ import EXIT_OK, EXIT_USAGE, main  # noqa: E402
+from email_guard_webui.__main__ import (  # noqa: E402
+    EXIT_INSECURE,
+    EXIT_OK,
+    EXIT_USAGE,
+    main,
+)
 
 
 @pytest.fixture
@@ -182,8 +187,16 @@ def test_a_non_loopback_bind_is_refused(project, uvicorn_calls, capsys):
     assert "refusing to bind 0.0.0.0" in capsys.readouterr().err
 
 
-def test_a_non_loopback_bind_can_be_asked_for_explicitly(project, uvicorn_calls):
-    """The container case: the published port is pinned to loopback on the host."""
+def test_a_non_loopback_bind_can_be_asked_for_explicitly(project, uvicorn_calls, monkeypatch):
+    """The container case: the published port is pinned to loopback on the host.
+
+    That second half is now stated rather than assumed. A 0.0.0.0 bind on its
+    own no longer starts without a token -- the process cannot tell a
+    loopback-published container from a console on the LAN, so compose tells it
+    (`EMAIL_GUARD_WEBUI_PUBLISHED_BIND`), and the untold case fails closed.
+    """
+    monkeypatch.setenv(webui_config.ENV_PUBLISHED_BIND, "127.0.0.1")
+
     assert main(base_argv(project) + ["--host", "0.0.0.0", "--allow-non-loopback"]) == EXIT_OK
 
     assert uvicorn_calls[0]["host"] == "0.0.0.0"
@@ -191,7 +204,132 @@ def test_a_non_loopback_bind_can_be_asked_for_explicitly(project, uvicorn_calls)
 
 def test_the_environment_can_grant_the_same_permission(project, uvicorn_calls, monkeypatch):
     monkeypatch.setenv(webui_config.ENV_ALLOW_NON_LOOPBACK, "1")
+    monkeypatch.setenv(webui_config.ENV_PUBLISHED_BIND, "127.0.0.1")
 
     assert main(base_argv(project) + ["--host", "0.0.0.0"]) == EXIT_OK
 
     assert uvicorn_calls[0]["host"] == "0.0.0.0"
+
+
+# --- reachable off this host with no token: refuse, do not warn -------------------
+#
+# The console renders attacker-controlled mail and edits the lists that decide
+# what is delivered. "It is on loopback" is what stands in for authentication;
+# once that stops being true and no token has replaced it, the honest response
+# is to not start. A warning was what this used to do, and a warning scrolls
+# past in a container log while the console serves the LAN anyway.
+
+
+def test_non_loopback_with_no_token_refuses_to_start(project, uvicorn_calls, capsys):
+    """(a) The combination the guard exists for."""
+    exit_code = main(base_argv(project) + ["--host", "0.0.0.0", "--allow-non-loopback"])
+
+    assert exit_code == EXIT_INSECURE
+    assert exit_code != EXIT_OK
+    assert uvicorn_calls == [], "it must refuse BEFORE anything binds"
+    error = capsys.readouterr().err
+    assert "refusing to start" in error
+    assert webui_config.ENV_TOKEN in error
+
+
+def test_non_loopback_with_a_token_starts(project, uvicorn_calls, monkeypatch):
+    """(b) A token is what makes the exposed case legitimate."""
+    monkeypatch.setenv(webui_config.ENV_TOKEN, "s3cret")
+
+    assert main(base_argv(project) + ["--host", "0.0.0.0", "--allow-non-loopback"]) == EXIT_OK
+
+    assert uvicorn_calls[0]["host"] == "0.0.0.0"
+
+
+def test_loopback_with_no_token_still_starts(project, uvicorn_calls):
+    """(c) The development path. Only this host can reach it, so no token needed."""
+    assert main(base_argv(project)) == EXIT_OK
+
+    assert uvicorn_calls[0]["host"] == "127.0.0.1"
+
+
+def test_a_token_from_the_secrets_file_satisfies_the_guard(project, uvicorn_calls):
+    """The guard reads `auth_enabled`, not the env var -- the token has two homes.
+
+    Keying on `EMAIL_GUARD_WEBUI_TOKEN` alone would refuse to start a correctly
+    configured console whose token lives in the git-ignored secrets file.
+    """
+    (project / "config" / "secrets.json").write_text(
+        json.dumps({"webui": {"token": "from-file"}}), encoding="utf-8"
+    )
+
+    assert main(base_argv(project) + ["--host", "0.0.0.0", "--allow-non-loopback"]) == EXIT_OK
+
+    assert uvicorn_calls[0]["host"] == "0.0.0.0"
+
+
+def test_a_lan_publication_with_no_token_refuses(project, uvicorn_calls, monkeypatch):
+    """The compose case this whole change is about: BIND=0.0.0.0, empty token."""
+    monkeypatch.setenv(webui_config.ENV_ALLOW_NON_LOOPBACK, "1")
+    monkeypatch.setenv(webui_config.ENV_PUBLISHED_BIND, "0.0.0.0")
+
+    assert main(base_argv(project) + ["--host", "0.0.0.0"]) == EXIT_INSECURE
+
+    assert uvicorn_calls == []
+
+
+def test_an_unknown_publication_fails_closed(project, uvicorn_calls, monkeypatch):
+    """An older compose file against a newer image: no publication fact, no start.
+
+    Refusing here is the deliberate choice. The alternative -- assume loopback
+    when nobody said -- is the assumption that would have to be wrong only once.
+    """
+    monkeypatch.setenv(webui_config.ENV_ALLOW_NON_LOOPBACK, "1")
+    monkeypatch.delenv(webui_config.ENV_PUBLISHED_BIND, raising=False)
+
+    assert main(base_argv(project) + ["--host", "0.0.0.0"]) == EXIT_INSECURE
+
+    assert uvicorn_calls == []
+
+
+@pytest.mark.parametrize("published", ["127.0.0.1", "::1", "localhost", " 127.0.0.1 "])
+def test_a_loopback_publication_is_recognised(project, uvicorn_calls, monkeypatch, published):
+    monkeypatch.setenv(webui_config.ENV_PUBLISHED_BIND, published)
+
+    assert main(base_argv(project) + ["--host", "0.0.0.0", "--allow-non-loopback"]) == EXIT_OK
+
+
+@pytest.mark.parametrize("published", ["0.0.0.0", "192.168.1.42", "::", "10.0.0.5"])
+def test_a_reachable_publication_is_recognised(project, uvicorn_calls, monkeypatch, published):
+    monkeypatch.setenv(webui_config.ENV_PUBLISHED_BIND, published)
+
+    assert main(base_argv(project) + ["--host", "0.0.0.0", "--allow-non-loopback"]) == EXIT_INSECURE
+
+
+# --- the predicate on its own ------------------------------------------------------
+
+
+def test_reachable_beyond_this_host_is_fail_closed(project):
+    """Unit-level, so the three cases are visible without going through main()."""
+    loopback = webui_config.load(config_path=write_config(project), environ={})
+    exposed = webui_config.load(
+        config_path=write_config(project), environ={webui_config.ENV_HOST: "0.0.0.0"}
+    )
+
+    # A loopback bind is unreachable from elsewhere whatever the environment says.
+    assert webui_config.reachable_beyond_this_host(loopback, {}) is False
+    assert (
+        webui_config.reachable_beyond_this_host(
+            loopback, {webui_config.ENV_ALLOW_NON_LOOPBACK: "1"}
+        )
+        is False
+    )
+    # A non-loopback bind is reachable unless the publication says otherwise.
+    assert webui_config.reachable_beyond_this_host(exposed, {}) is True
+    assert (
+        webui_config.reachable_beyond_this_host(
+            exposed, {webui_config.ENV_PUBLISHED_BIND: "127.0.0.1"}
+        )
+        is False
+    )
+    assert (
+        webui_config.reachable_beyond_this_host(
+            exposed, {webui_config.ENV_PUBLISHED_BIND: "0.0.0.0"}
+        )
+        is True
+    )

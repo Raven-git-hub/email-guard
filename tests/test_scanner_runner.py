@@ -349,13 +349,38 @@ def test_no_service_publishes_a_wildcard_address():
     )
 
 
+def test_the_console_is_told_the_publication_it_cannot_observe():
+    """The line that makes "LAN needs a token" enforceable instead of advisory.
+
+    A container cannot see which HOST interface its port was published on -- it
+    binds 0.0.0.0 inside its own namespace either way -- so compose passes the
+    address in. The console refuses to start when that says LAN and no token is
+    set (`email_guard_webui.config.reachable_beyond_this_host`).
+
+    Both values must come from the SAME variable. Feeding them separately would
+    let the publication and what the console believes about it drift apart,
+    which is worse than not telling it at all: the guard would pass while the
+    console sat on the LAN.
+    """
+    webui = _compose()["services"]["webui"]
+    published = webui["environment"]["EMAIL_GUARD_WEBUI_PUBLISHED_BIND"]
+    # The leading `${...}` of the ports entry -- not `split(":")`, which would
+    # cut inside the `:-default`.
+    bind = re.match(r"^(\$\{[^}]*\})", str(webui["ports"][0])).group(1)
+
+    assert published == "${EMAIL_GUARD_WEBUI_BIND:-127.0.0.1}"
+    assert published == bind, (
+        "the published bind told to the container must be the same expression "
+        f"as the one in `ports:` -- {published!r} vs {bind!r}"
+    )
+
+
 def test_the_console_still_requires_a_token_off_loopback():
     """Parameterising the bind must not touch the auth wiring it depends on.
 
-    Compose cannot enforce "LAN needs a token" -- nothing in the container can
-    see which host interface the port was published on -- so the obligation is
-    documented in .env.sample instead, and the token plumbing has to stay
-    intact for an operator to be able to meet it.
+    The rule is now enforced at startup, but enforcement only helps if an
+    operator can satisfy it: the token still has to reach the container, and
+    .env.sample still has to say the two go together.
     """
     environment = _compose()["services"]["webui"]["environment"]
     sample = (DISPATCHER_PACKAGE.parents[1] / ".env.sample").read_text(encoding="utf-8")

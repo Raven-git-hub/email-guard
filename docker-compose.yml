@@ -384,9 +384,28 @@ services:
     networks: [default, rulesctl]
 
     environment:
+      # The container binds every interface INSIDE its own namespace -- that is
+      # what makes a published port reach it at all -- and the `ports:` entry
+      # below decides who can actually connect. These two say the first part.
       EMAIL_GUARD_WEBUI_HOST: "0.0.0.0"
       EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK: "1"
       EMAIL_GUARD_WEBUI_PORT: "8080"
+
+      # ... and this says the second, which the process cannot see for itself:
+      # a container has no way to learn which host interface its port was
+      # published on. Fed from the SAME variable as the `ports:` entry, so the
+      # two cannot disagree.
+      #
+      # It is what lets the console refuse to start when it would be
+      # unauthenticated on the LAN (`EMAIL_GUARD_WEBUI_BIND=0.0.0.0` with an
+      # empty token) while still starting for the loopback-published default,
+      # where "reachable from this host only" is doing the same job a token
+      # would. Unset -- an older compose file against a newer image -- is read
+      # as exposed, and then a token is required.
+      EMAIL_GUARD_WEBUI_PUBLISHED_BIND: "${EMAIL_GUARD_WEBUI_BIND:-127.0.0.1}"
+
+      # REQUIRED when EMAIL_GUARD_WEBUI_BIND is not loopback: the console
+      # refuses to start LAN-reachable with this empty. See .env.sample.
       EMAIL_GUARD_WEBUI_TOKEN: "${EMAIL_GUARD_WEBUI_TOKEN:-}"
 
       # Where "Refresh rules" goes. The console has no git and no write access
