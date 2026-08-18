@@ -9,6 +9,11 @@ Two entry points, sharing everything up to the verdict:
   the message to ``<outbound_dir>/<bucket>/<job>/`` and stages a daily-brief
   candidate when the message is worth a human's attention.
 
+The verdict is complete before anything is written, and the write stage cannot
+change it -- except to record what it wrote (``written``, and the manifest of
+extracted attachments). That ordering is why an attachment's bytes can never
+influence a level: by the time they are touched, the level is decided.
+
 The date used for the daily-brief folder is a parameter (``now``), not a call
 to the clock buried in the logic: the same message scanned twice with the same
 date must produce identical files.
@@ -147,6 +152,7 @@ def scan_and_write(
         "dir": str(paths["dir"]),
         "report": str(paths["report"]),
         "message": str(paths["message"]),
+        "complete": str(paths["complete"]),
         "candidate": str(candidate_file) if candidate_file else None,
     }
 

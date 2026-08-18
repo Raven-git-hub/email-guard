@@ -498,6 +498,65 @@ def test_the_verdict_paths_point_at_where_the_files_actually_are(runner, docker,
     assert written["bucket"] == "flagged"
 
 
+def test_the_completion_sentinel_lands_last_in_the_shared_store(
+    runner, docker, settings, monkeypatch
+):
+    """The publisher watches the SHARED tree, so the ordering has to survive the move.
+
+    The scanner writes `.complete` last inside its private spool, but this move
+    re-creates the job directory file by file -- and `.` sorts below every
+    letter, so plain alphabetical order would put the sentinel down first and
+    advertise a job directory holding nothing else. Assert what is present at
+    the moment the sentinel arrives, which is the property the publisher relies
+    on.
+    """
+    import os as os_module
+
+    from email_guard_dispatcher import container_runner as module
+
+    seen: dict[str, set[str]] = {}
+    real_replace = os_module.replace
+
+    def spy(source, target):
+        if Path(target).name == module.COMPLETE_NAME:
+            seen["siblings"] = {entry.name for entry in Path(target).parent.iterdir()}
+        return real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", spy)
+
+    def writes_a_complete_job(argv: list[str]) -> DockerResult:
+        outbound = mount_source(argv, CONTAINER_OUTBOUND)
+        job = outbound / "cleared" / "hello-1"
+        job.mkdir(parents=True, exist_ok=True)
+        (job / "report.json").write_bytes(b'{"ok": true}')
+        (job / "message.eml").write_bytes(RAW)
+        (job / "receipt.png").write_bytes(b"PNG-BYTES")
+        (job / module.COMPLETE_NAME).write_bytes(b"")
+        (mount_source(argv, CONTAINER_DAILY_BRIEF)).mkdir(parents=True, exist_ok=True)
+        return DockerResult(exit_code=0, stdout=json.dumps(VERDICT).encode())
+
+    docker.on("run", writes_a_complete_job)
+    runner.scan(RAW)
+
+    assert seen["siblings"] == {"report.json", "message.eml", "receipt.png"}
+    job = settings.outbound_dir / "cleared" / "hello-1"
+    assert (job / module.COMPLETE_NAME).is_file()
+    assert (job / "receipt.png").read_bytes() == b"PNG-BYTES"
+
+
+def test_the_sentinel_name_matches_the_scanners(runner):
+    """Duplicated across the subprocess boundary on purpose -- so pin the value.
+
+    The dispatcher imports nothing from the scanner, so this one-word contract
+    is restated rather than shared. If the scanner ever renames its sentinel,
+    this fails instead of the publisher silently never firing.
+    """
+    from email_guard.route import COMPLETE_NAME as scanner_name
+    from email_guard_dispatcher.container_runner import COMPLETE_NAME as dispatcher_name
+
+    assert dispatcher_name == scanner_name
+
+
 def test_the_spool_is_cleaned_up_after_every_scan(runner, docker, settings):
     docker.on("run", scanner_writes())
 

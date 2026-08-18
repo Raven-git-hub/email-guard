@@ -232,6 +232,13 @@ the live lists. It is the only component that imports the scanner as a library �
 to find them. Stats, quarantine browsing and the event log are Phase 2. See "Running the
 review console".
 
+**Publisher (host-side)** — the one component that is **not** a container, and deliberately
+so. It copies finished job directories from local disk to the mounted network partition
+(`/mnt/network/acheron`) for the downstream consumer, and expires the local copies once
+they are safely there. It is stdlib-only Python run by two systemd units on the host under
+an ordinary user account; the sandboxed containers have no mount for the partition and no
+route to the drive. See "Publishing to acheron".
+
 ---
 
 ## Normalised message shape
@@ -520,6 +527,8 @@ scanner persists three things.
 data/outbound/<bucket>/<job>/report.json    # the full verdict
 data/outbound/<bucket>/<job>/message.eml    # the original, byte for byte
                         ... /message.json   # ... or the --from-json input
+                        ... /<attachment>   # cleared mail only -- raw bytes
+                        ... /.complete      # written LAST: "safe to publish"
 data/daily-brief/daily-brief-<YYYY-MM-DD>/<job>/candidate.json
 ```
 
@@ -536,6 +545,45 @@ data/daily-brief/daily-brief-<YYYY-MM-DD>/<job>/candidate.json
   message matched, empty otherwise. This is what the outbound webhook dispatches on.
 - Re-scanning the same message with the same date **overwrites its own files identically** —
   no timestamps, no run ids, fixed JSON formatting.
+
+#### Extracted attachments — `cleared` mail only
+
+A cleared message's attachments are written into the job directory as **raw bytes**, so the
+directory is a self-contained package a downstream machine can consume without ever seeing
+the mailbox. Four rules, and each one is load-bearing:
+
+- **Cleared only.** `flagged` and `rejected` jobs are written exactly as before — report plus
+  the verbatim message, nothing materialised. Quarantine keeps the whole message (attachments
+  and all) for a human reviewer; what it does not do is put an attacker's file on disk under
+  its own name.
+- **Bytes only, never parsed.** Nothing in this system opens, sniffs, unpacks or executes an
+  attachment. The only transformation applied is the MIME *transfer* decoding — base64 back to
+  the octets the sender attached. Inspection is the downstream consumer's job, on its own
+  machine. The verdict is computed **before** any attachment is touched, which is why an
+  attachment's content can never move a threat level.
+- **The filename is sanitised.** It is attacker-controlled and about to become a path, so it
+  is treated like the message id: directory components stripped (`../../etc/passwd` →
+  `passwd`, `C:\Windows\evil.exe` → `evil.exe`), unicode transliterated, everything outside
+  `[A-Za-z0-9._-]` collapsed to `-`, length capped at 100 characters keeping the extension,
+  collisions de-duped (`invoice.pdf`, `invoice-1.pdf`), and the names the package already owns
+  refused — an attachment called `report.json` is stored as `attachment-report.json`, and one
+  called `.complete` cannot forge the sentinel.
+- **Recorded in `report.json`.** The verdict grows an `extracted_attachments` list: for each
+  file on disk, the sender's `original_name`, the `stored_name`, the declared `content_type`,
+  the `size`, and the `sha256` of the bytes. (Distinct from `attachments`, which is what the
+  *message* claims; this is what is on disk.) A consumer can verify what it received without
+  re-deriving anything.
+
+#### `.complete` — the "safe to publish" sentinel
+
+An empty file, written **last**, after the report, the message copy and every attachment are
+on disk. Its presence means the job directory is whole; its absence means it may be half
+written. **Nothing may act on a job directory without it** — that is the contract the
+host-side publisher relies on, and it holds for every bucket, because it means "this job is
+finished", not "this job cleared".
+
+It is a signal, not a record: it is empty on purpose, so nothing is tempted to read it
+instead of `report.json`.
 
 A `candidate.json` is staged only for `unknown_domain` (sender on no list) and
 `new_structure` (greylisted domain, uncatalogued shape). `skip` writes nothing, and
@@ -1180,6 +1228,162 @@ Full first-run procedure and diagnosis: **`VALIDATION.md`**.
 
 ---
 
+## Publishing to acheron
+
+A finished job is useful to exactly one machine, and it is not this one. **Smiley** — the
+downstream consumer — reads completed job packages off a shared network drive, does its own
+security inspection of the attachments, and handles calendar and the rest. This section is
+how a package gets from local disk to that drive.
+
+### The boundary, and why the bridge is on the host
+
+The scanner and dispatcher run in hardened containers that see local disk and nothing else.
+The wider network drive is **not reachable from the sandbox** — only a mounted partition,
+`/mnt/network/acheron`, is reachable, and only from the **host**.
+
+The hard rule follows from that: **no scanner or dispatcher container ever touches
+`/mnt/network/acheron`.** Not "should not" — there is no mount for it in `docker-compose.yml`
+and no environment variable naming it, so a compromised scanner cannot reach the share
+whatever it does. The blast radius of hostile mail stops at a local job directory.
+
+So the crossing is made by a **host-side component**: `publisher/`, a small stdlib-only
+Python package run by two systemd units as an ordinary user. It ships in this repository, it
+is deliberately **not** a `packages.find` root, and no image copies it — the code that can
+reach acheron is not inside anything that handles mail.
+
+```
+scanner container ──writes──▶ data/outbound/<bucket>/<job>/        (local disk, sandboxed)
+                                           │
+                              HOST: systemd path unit ──▶ publisher
+                                           │
+                                           ▼
+                              /mnt/network/acheron/email-guard/<bucket>/<job>/
+                                           │
+                                     ──read by──▶ Smiley  (inspection, calendar, …)
+```
+
+### The Smiley contract
+
+What the consumer is promised, and may build on:
+
+- **A job appears whole, or not at all.** The copy is assembled in a dot-prefixed staging
+  directory *inside the destination bucket* — the same filesystem — and the final step is a
+  single `rename`, which POSIX makes atomic. A consumer scanning the bucket mid-copy sees
+  either nothing or a complete package. It never sees a half-written `report.json`, and never
+  an attachment arriving after the report that describes it. Ignore dot-prefixed entries when
+  listing a bucket and there is nothing else to guard against.
+- **The path is deterministic:** `/mnt/network/acheron/email-guard/<bucket>/<job>/`, where
+  `<bucket>` is `cleared` / `flagged` / `rejected` and `<job>` is the same job slug the
+  scanner used. Given the bucket and the job id, the path can be constructed. Nothing is
+  renamed, re-slugged or re-ordered on the way across.
+- **The package is clean:** `report.json`, the verbatim `message.eml` (or `message.json`), and
+  the extracted attachments. The internal markers `.complete` and `.published` are ours and
+  stay on the host — a package on acheron is whole by construction, so a sentinel there would
+  say nothing.
+- **It is self-describing.** `report.json` carries `extracted_attachments`: original name,
+  stored name, content type, size and SHA-256 for every file beside it. Verify against those
+  rather than trusting the filename.
+- **Nothing here has opened an attachment.** Inspection is Smiley's job, on Smiley's machine.
+
+**Triggering is unchanged.** Smiley is woken by the **existing n8n webhook**, fired by the
+dispatcher as it always has been — no new signalling was added. The webhook and the file are
+independent paths, and the file may land **a beat after** the webhook: the dispatcher POSTs
+as soon as the scan returns, while the publisher fires on the job directory appearing. The
+gap is normally well under a second, but it is a race, so a consumer should **retry briefly**
+if the directory is not there yet (or if it is there without the file it wants — see the
+atomicity note above, which makes that impossible for a *complete* job, and possible only if
+it looks before the rename). Treat the webhook as "a job is coming", not "the job is there".
+
+### What the publisher does
+
+For each local job directory that has `.complete` and does not have `.published`:
+
+1. copy the package (everything except the two markers) into a staging directory inside the
+   destination bucket, flushing each file to disk;
+2. `rename` the staging directory to `<bucket>/<job>` — the atomic step;
+3. write `.published` locally, naming where the package went.
+
+And the guarantees on the other side of that:
+
+- **Idempotent.** A job with `.published` is skipped. A job the destination already has (a
+  crash between step 2 and step 3) is marked, not re-copied. One consequence worth knowing:
+  **re-scanning an already-published message does not republish it.** The local files are
+  rewritten, the marker still says "sent", and acheron keeps the package the consumer
+  actually received. To push a corrected package, delete the job's `.published` marker (and
+  the directory on the destination, since a job the destination already has is not
+  re-copied).
+- **A network outage costs disk, never mail.** An unreachable destination is logged and
+  skipped — no marker is written, nothing is deleted, and the jobs stay pending. They drain
+  on their own when the mount comes back. `.published` is *never* written for a failed or
+  partial copy, and the publisher never deletes a local job.
+- **A bad job does not stop the queue.** A per-job failure is logged; the rest still publish
+  and the failed one retries on the next fire.
+
+### Retention: the local copy expires, the published one does not
+
+A daily timer deletes local job directories that are `.published` **and** older than
+`EMAIL_GUARD_OUTBOUND_RETENTION_DAYS` (default **14**), counted from the moment the job was
+published rather than scanned. An **unpublished** job is never deleted, at any age — which is
+the other half of "an outage costs disk, not mail". The sweep never touches the destination:
+acheron's copy belongs to Smiley, and its lifetime is that machine's business. (The cleanup
+unit is not even given the partition in its `ReadWritePaths`.)
+
+### Installing the two units
+
+Both units live in `publisher/systemd/` and both read one `EnvironmentFile`, so nothing is
+hardcoded and the two can never skew:
+
+```bash
+# on the host (cerberus) -- no container rebuild, no pip install
+sudo install -d -m 0755 /etc/email-guard
+sudo install -m 0644 publisher/systemd/publisher.env.sample /etc/email-guard/publisher.env
+sudoedit /etc/email-guard/publisher.env          # set the two paths
+
+sudo cp publisher/systemd/email-guard-*.{path,service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now email-guard-publisher.path      # fires on each new job
+sudo systemctl enable --now email-guard-publisher.timer     # the backstop sweep
+sudo systemctl enable --now email-guard-cleanup.timer       # daily retention
+```
+
+| Setting | Environment (in `publisher.env`) | Default |
+|---------|----------------------------------|---------|
+| Source tree, **as the host sees it** | `EMAIL_GUARD_OUTBOUND_DIR` | `data/outbound` |
+| Destination on the partition | `EMAIL_GUARD_PUBLISH_DEST` | `/mnt/network/acheron/email-guard` |
+| Which buckets are published | `EMAIL_GUARD_PUBLISH_BUCKETS` | `cleared,flagged,rejected` |
+| Local retention window, days | `EMAIL_GUARD_OUTBOUND_RETENTION_DAYS` | `14` |
+
+Notes an operator will want before the first run:
+
+- `EMAIL_GUARD_OUTBOUND_DIR` is the **host** path — the bind source of the `email-guard-data`
+  volume, `${EMAIL_GUARD_HOST_ROOT}/data/outbound` — never the `/app/data/outbound` a
+  container sees.
+- Both units run as **uid 1000** (`User=1000`, the same uid the containers use on cerberus),
+  so nothing changes owner when it is published and the tree stays editable by hand. They need
+  read+write on both trees: the publisher writes `.published` markers locally.
+- The `.path` unit watches the three **bucket** directories, because systemd path units do not
+  recurse and a `.complete` sentinel is two levels down. Creating a job directory modifies its
+  bucket, which is the event. That fires a fraction of a second before the sentinel is written,
+  so a fire can arrive too early — the publisher simply skips a job with no sentinel, and
+  `email-guard-publisher.timer` (every five minutes) is what turns "usually instant" into
+  "always, eventually". **Install both.**
+- The unit files name absolute paths in `PathModified=` and `ReadWritePaths=`, which systemd
+  cannot take from the `EnvironmentFile`. If the tree moves, they move with it.
+- `python3 -m email_guard_publisher status` prints the configuration and the backlog and
+  changes nothing. It is the first thing to run after editing the env file.
+
+### Deploying this feature
+
+- **Attachment extraction + the sentinel** is scanner code: rebuild the scanner image on
+  cerberus (`docker compose --profile build build scanner`) — see "Updating the scanner".
+- **The publisher and the retention sweep** are host units: `install` + `systemctl enable`, as
+  above. No container rebuild, and nothing in `docker-compose.yml` changes.
+
+The full procedure, with the checks that prove each half works, is in **`VALIDATION.md`**,
+"Publishing to the acheron partition".
+
+---
+
 ## Databases & the daily review
 
 ### List schemas (from the live samples)
@@ -1248,6 +1452,14 @@ committed** to the repo — which may be published later.
 - The review console serves mail content to a browser on loopback and adds no new store: it
   reads the same `data/daily-brief/` and writes the same `data/lists/`. Nothing it renders is
   cached (`Cache-Control: no-store` on every API response).
+- **A published job leaves this host.** `data/outbound/` is whole messages and real senders,
+  and the publisher copies cleared (by default also flagged and rejected) job packages to
+  `/mnt/network/acheron/email-guard/` for the downstream machine — attachments included. That
+  share is as sensitive as the local store and wants the same treatment: restricted
+  permissions, and a considered answer to who else can read the drive. Narrowing
+  `EMAIL_GUARD_PUBLISH_BUCKETS` to `cleared` keeps quarantined mail on this host entirely.
+  Nothing about acheron is committed: it is a mount point, not a path in this repository's
+  data directories.
 
 ### Greylist match outcomes
 
@@ -1396,7 +1608,8 @@ email-guard/
 │       ├── deepscan.py         # runs the rules pack
 │       ├── assess.py
 │       ├── canary.py
-│       ├── route.py
+│       ├── route.py            # bucket → job dir; writes the `.complete` sentinel LAST
+│       ├── attachments.py      # cleared attachments: raw bytes out, filenames sanitised
 │       ├── propose.py          # writes daily-brief candidates
 │       ├── apply.py            # decisions document in → live lists out
 │       └── outputs.py
@@ -1408,6 +1621,14 @@ email-guard/
 │   │   └── phishing_signatures.json    # level 2 — deliberately empty
 │   ├── signatures/             # prompt-injection.json  (starts empty)
 │   └── validate.py             # load-time + CI validator (scan rules only)
+├── publisher/                   # HOST-side, NOT a container — the only bridge to acheron
+│   ├── email_guard_publisher/  # stdlib-only: run from the checkout, installed nowhere
+│   │   ├── __main__.py         # publish | cleanup | status
+│   │   ├── config.py           # the EnvironmentFile both units read
+│   │   ├── markers.py          # `.complete` / `.published` — the contract with the scanner
+│   │   ├── publish.py          # copy → atomic rename into ${DEST}/<bucket>/<job>/
+│   │   └── cleanup.py          # retention: published AND old, never anything else
+│   └── systemd/                # the path unit, the timers, and the EnvironmentFile sample
 ├── canary/                      # local model service config (e.g. Ollama)
 ├── webui/                       # the review console — localhost-bound FastAPI + one page
 │   ├── Dockerfile
@@ -1428,7 +1649,8 @@ email-guard/
 └── data/                        # runtime data — git-ignored except *.sample.json
     ├── lists/                  # live lists (host-provided / bind-mounted); ships *.sample.json + .gitkeep
     ├── daily-brief/            # staged candidates awaiting review
-    ├── outbound/               # cleared/  flagged/  rejected/
+    ├── outbound/               # cleared/  flagged/  rejected/  (each job: report, message,
+    │                           #   cleared attachments, `.complete`, then `.published`)
     └── dispatcher/             # state.json (processed UIDs) + quarantine.log
 ```
 
@@ -1488,8 +1710,16 @@ email-guard/
     it does nothing for the sender you want *structure-sorted*, where the fix is capturing
     short stable phrases rather than paragraph-length ones. That is a fuzzier change (what
     makes a phrase stable is a judgement about a corpus, not a rule) and belongs on its own.
-11. Wire up consolidated-inbox delivery for `cleared` mail.
+11. Wire up consolidated-inbox delivery for `cleared` mail. ~~Get a finished job to the
+    downstream machine~~ **Done** — a cleared job now carries its attachments as raw bytes
+    and a `.complete` sentinel, and the host-side publisher copies whole job packages to
+    `/mnt/network/acheron/email-guard/<bucket>/<job>/` for Smiley to consume (see "Publishing
+    to acheron"). Still to do: the consolidated *mailbox* itself, which is a different
+    delivery from a file on a share.
 12. Seed the prompt-injection signature DB (Canary-assisted) as real traffic is seen.
 13. Fix the known issues; add a regression corpus of real sample messages.
-14. *(Optional, later)* Attachment content inspection as defense-in-depth.
+14. *(Optional, later)* Attachment content inspection as defense-in-depth. Note this is
+    **not** a gap in the current design: attachments are inspected downstream, by Smiley, on
+    its own machine. This item is about a *second* pass on this host — which would mean
+    opening an attacker's file inside the sandbox, and needs to earn that.
 ```

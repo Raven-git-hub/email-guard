@@ -11,10 +11,27 @@ Every scanned message lands in::
     <outbound_dir>/<bucket>/<job>/report.json    # the full verdict
     <outbound_dir>/<bucket>/<job>/message.eml    # the original, verbatim
                               ... /message.json  # ... or the --from-json input
+                              ... /<attachment>  # cleared mail only, raw bytes
+                              ... /.complete     # written LAST -- see below
 
 The original is copied byte for byte and never re-serialised: quarantine is
 forensic storage, so what the scanner saw must be what a reviewer later reads.
 ``<job>`` is a filesystem-safe slug of the message id -- see :func:`job_slug`.
+
+Two things beyond the report and the message copy:
+
+* **Attachments, for ``cleared`` mail only.** Their raw bytes are written beside
+  the report under sanitised names, and each one is listed in the verdict's
+  ``extracted_attachments`` so the directory is self-describing. Nothing here
+  opens, parses or executes them -- see :mod:`email_guard.attachments`. A
+  ``flagged`` or ``rejected`` job is written exactly as it always was: report
+  plus the verbatim message, no materialised files.
+* **A ``.complete`` sentinel, written LAST.** Its presence means "every file of
+  this job is on disk"; its absence means a job directory may be half written.
+  Nothing may act on a job directory without it -- specifically the host-side
+  publisher (``publisher/``), which is what puts a package on the network
+  partition for the downstream consumer. It is the ONLY ordering guarantee this
+  module makes, so it is made explicitly rather than relying on write order.
 """
 
 from __future__ import annotations
@@ -26,6 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import attachments as attachments_module
+
 REJECTED = "rejected"
 FLAGGED = "flagged"
 CLEARED = "cleared"
@@ -33,6 +52,12 @@ CLEARED = "cleared"
 BUCKETS = (CLEARED, FLAGGED, REJECTED)
 
 REPORT_NAME = "report.json"
+# The "safe to publish" signal. Written last, read by the host-side publisher;
+# `publisher/email_guard_publisher/markers.py` carries the same two constants,
+# deliberately duplicated -- the publisher runs on the host with no scanner
+# package installed, so the name is a wire contract between them, not an import.
+COMPLETE_NAME = ".complete"
+PUBLISHED_NAME = ".published"
 
 # A message id may legally contain almost anything between the angle brackets,
 # including `/` and `..`, and it arrives from a hostile source -- so it is
@@ -129,15 +154,78 @@ def plan_paths(outbound_dir: str | Path, bucket: str, job: str, source: SourceMe
         "dir": directory,
         "report": directory / REPORT_NAME,
         "message": directory / source.filename,
+        "complete": directory / COMPLETE_NAME,
     }
 
 
 def write_outbound(verdict: dict[str, Any], source: SourceMessage, paths: dict) -> None:
-    """Write ``report.json`` + the verbatim message copy into the job directory."""
+    """Write the whole job directory, in the one order that is guaranteed.
+
+        message copy -> attachments -> report.json -> .complete
+
+    The report is written after the attachments because it *describes* them: the
+    manifest it carries is built from what actually landed on disk, not from
+    what the message claimed. The sentinel is written after the report because
+    it means "all of the above is here" -- see the module docstring.
+
+    Attachments are extracted for ``cleared`` mail only. The check lives here,
+    at the one place that writes, rather than in the extractor: whatever else
+    changes, a quarantined message cannot put a file on disk.
+    """
     directory: Path = paths["dir"]
     directory.mkdir(parents=True, exist_ok=True)
-    write_json(paths["report"], verdict)
     paths["message"].write_bytes(source.raw)
+
+    extracted = (
+        attachments_module.extract(source.kind, source.raw)
+        if verdict.get("bucket") == CLEARED
+        else []
+    )
+    verdict["extracted_attachments"] = write_attachments(directory, extracted)
+
+    write_json(paths["report"], verdict)
+    mark_complete(directory)
+
+
+def write_attachments(
+    directory: Path, extracted: list["attachments_module.Attachment"]
+) -> list[dict[str, Any]]:
+    """Write each attachment's bytes and return the manifest describing them.
+
+    The manifest is what makes the package self-describing: for every file on
+    disk it names the sender's original filename, the declared content type, the
+    size, the SHA-256 of the bytes, and the sanitised name they were stored
+    under. A consumer can therefore verify what it received without trusting
+    (or re-deriving) anything about the message.
+    """
+    manifest: list[dict[str, Any]] = []
+    taken: set[str] = {REPORT_NAME, COMPLETE_NAME, PUBLISHED_NAME}
+    for item in extracted:
+        stored = attachments_module.sanitise_name(item.filename, taken)
+        taken.add(stored)
+        (directory / stored).write_bytes(item.data)
+        manifest.append(
+            {
+                "original_name": item.filename,
+                "stored_name": stored,
+                "content_type": item.content_type,
+                "size": len(item.data),
+                "sha256": attachments_module.digest(item.data),
+            }
+        )
+    return manifest
+
+
+def mark_complete(directory: Path) -> Path:
+    """Write the ``.complete`` sentinel -- the last thing to touch a job directory.
+
+    Empty on purpose: it is a signal, not a record. Anything worth reading is in
+    ``report.json``, and giving this file content would invite a consumer to
+    read it *instead* of the report.
+    """
+    marker = Path(directory) / COMPLETE_NAME
+    marker.write_bytes(b"")
+    return marker
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:

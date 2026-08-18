@@ -1,0 +1,21 @@
+# Daily retention sweep.
+#
+#   sudo systemctl enable --now email-guard-cleanup.timer
+#   systemctl list-timers email-guard-*        # confirm the next run
+
+[Unit]
+Description=Daily expiry of published Email Guard jobs
+Documentation=file:/opt/email-guard/README.md
+
+[Timer]
+# Overnight, and jittered: nothing depends on the exact minute, and the spread
+# keeps it out of the way of anything else the host does at 03:00 sharp.
+OnCalendar=daily
+RandomizedDelaySec=1h
+# If the host was off at the scheduled time, run once on the next boot rather
+# than skipping the day.
+Persistent=true
+Unit=email-guard-cleanup.service
+
+[Install]
+WantedBy=timers.target

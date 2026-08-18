@@ -42,8 +42,19 @@ email-guard-rules-sync = "email_guard_rules_sync.__main__:main"
 # NOTE: every image's Dockerfile must COPY or `mkdir -p` all four roots, or
 # `pip install .` fails on the missing ones. tests/test_rules_sync_deploy.py
 # asserts that so the next root added cannot forget it.
+#
+# `publisher/` is deliberately ABSENT from this list, and that is the whole
+# point of it. It is the HOST-side bridge to the network partition
+# (/mnt/network/acheron) and it must never be installed into an image: the
+# scanner and dispatcher containers cannot be allowed to reach that share, and
+# the surest way to keep it that way is for the code that can to not be in
+# them. It is stdlib-only and runs from the checkout under systemd -- see
+# publisher/systemd/ -- so it needs no install anywhere. `pythonpath` below is
+# what makes it importable in the test suite, which is the only place it is
+# imported at all. tests/test_publisher_deploy.py holds this line to it.
 [tool.setuptools.packages.find]
 where = ["scanner", "dispatcher", "webui", "rules_sync"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["publisher"]

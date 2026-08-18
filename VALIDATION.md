@@ -229,6 +229,51 @@ This is also the proof that the private per-scan output directory was collected
 correctly — the scanner wrote into its own spool, and the dispatcher moved it
 here.
 
+**The job is marked finished, and marked finished LAST.** Every job directory,
+in every bucket, ends with an empty `.complete` sentinel:
+
+```sh
+ls -la data/outbound/*/*/
+```
+
+`.complete` is the "safe to publish" signal — nothing acts on a job directory
+without it. If it is ever present while `report.json` is not, something is
+writing out of order, and the host publisher (§11) must not be enabled until
+that is understood.
+
+**A cleared message's attachments are on disk, intact.** Send yourself a
+message from a greylisted sender with two attachments, then verify every file
+against the manifest the report carries:
+
+```sh
+ls data/outbound/cleared/*/          # report.json, message.eml, the files, .complete
+
+python3 -c '
+import glob, hashlib, json, pathlib
+for report in glob.glob("data/outbound/cleared/*/report.json"):
+    job = pathlib.Path(report).parent
+    for item in json.loads(pathlib.Path(report).read_text())["extracted_attachments"]:
+        blob = (job / item["stored_name"]).read_bytes()
+        ok = hashlib.sha256(blob).hexdigest() == item["sha256"] and len(blob) == item["size"]
+        print("OK " if ok else "BAD", job.name, item["original_name"], "->", item["stored_name"])
+'
+```
+
+Every line must say `OK`. The `->` is worth reading: the left side is the name
+the *sender* chose and the right side is the sanitised name on disk. They differ
+whenever the sender's name contained a path, unicode, or one of the package's
+own filenames — that is the sanitiser working, not a fault.
+
+**Quarantined mail materialises nothing.** A `flagged` or `rejected` job has the
+report, the verbatim message and the sentinel, and no extracted files:
+
+```sh
+ls data/outbound/flagged/*/ data/outbound/rejected/*/
+```
+
+The whole message is still there inside `message.eml` for a human reviewer. What
+is not there is an attacker's file sitting on disk under a name of its choosing.
+
 **A candidate was staged** (unknown sender only):
 
 ```sh
@@ -775,6 +820,269 @@ before reaching for anything else.
 | Change | Lands in | Needs |
 |--------|----------|-------|
 | `hidden_unicode` precision — zero-width padding no longer rejects, word-internal splits and hidden phrasing still do (`scanner/email_guard/triage.py`) | scanner image | `docker compose build` on cerberus |
+| Attachment extraction for cleared mail + the `.complete` sentinel (`scanner/email_guard/attachments.py`, `route.py`) | scanner image | `docker compose build` on cerberus. Until it is rebuilt, jobs carry no sentinel and the publisher (§11) correctly publishes nothing. |
+| Sentinel ordering when a scan container's output is merged into the shared tree (`dispatcher/email_guard_dispatcher/container_runner.py`) | dispatcher image | `docker compose build dispatcher && docker compose up -d dispatcher` |
+
+The host publisher and the retention sweep (§11) are the opposite case: they are
+**not** in any image, so they need no rebuild at all — `install` the units and
+`systemctl enable` them.
+
+---
+
+## 11. Publishing to the acheron partition
+
+Everything above stops at local disk. This section installs the two **host**
+units that carry a finished job across to `/mnt/network/acheron`, where the
+downstream machine ("Smiley") consumes it — and proves each guarantee that
+matters, including the ones that only show up when the network is down.
+
+Read the boundary first, because it is the thing not to undo: **the containers
+never mount acheron.** There is no volume for it in `docker-compose.yml`, no
+environment variable naming it, and the publisher's code is not installed into
+any image. The scanner handles hostile mail; the host publisher touches the
+share; those are different processes with different privileges, and that
+separation is the whole design. If you ever find yourself adding
+`/mnt/network/acheron` to a compose service to "make it simpler", stop — that is
+the failure this feature exists to prevent.
+
+### 11.0 Before you start
+
+```sh
+# the partition is mounted, and uid 1000 can write it
+mountpoint /mnt/network/acheron
+sudo -u '#1000' test -w /mnt/network/acheron && echo writable
+
+# the destination root exists and is owned by the same uid the containers use
+sudo install -d -o 1000 -g 1000 -m 0755 /mnt/network/acheron/email-guard
+```
+
+If the mount is absent, everything below still installs cleanly and simply does
+nothing: jobs accumulate locally, unpublished, until it comes back. That is the
+designed behaviour, not a degraded mode.
+
+### 11.1 Configure
+
+One `EnvironmentFile`, read by both units, so the paths and the retention window
+cannot skew between them:
+
+```sh
+cd /opt/email-guard          # wherever EMAIL_GUARD_HOST_ROOT points
+sudo install -d -m 0755 /etc/email-guard
+sudo install -m 0644 publisher/systemd/publisher.env.sample /etc/email-guard/publisher.env
+sudoedit /etc/email-guard/publisher.env
+```
+
+Set the two paths. The first is the one people get wrong:
+
+| Variable | Set it to | Note |
+|----------|-----------|------|
+| `EMAIL_GUARD_OUTBOUND_DIR` | `${EMAIL_GUARD_HOST_ROOT}/data/outbound` | The **host** path — the bind source of the `email-guard-data` volume. **Not** `/app/data/outbound`, which is what a container sees. |
+| `EMAIL_GUARD_PUBLISH_DEST` | `/mnt/network/acheron/email-guard` | Must be on the mounted partition: the copy is staged inside it so the last step can be an atomic rename, and a rename cannot cross a filesystem. |
+| `EMAIL_GUARD_PUBLISH_BUCKETS` | *(optional)* | All three by default. `cleared` alone keeps quarantined mail on this host. |
+| `EMAIL_GUARD_OUTBOUND_RETENTION_DAYS` | *(optional)* | Default 14. |
+
+Check it before installing anything — this reads the configuration, lists the
+backlog, and changes nothing:
+
+```sh
+sudo -u '#1000' env $(grep -v '^#' /etc/email-guard/publisher.env | xargs) \
+     PYTHONPATH=/opt/email-guard/publisher \
+     python3 -m email_guard_publisher status
+```
+
+Expect the two paths you set, the bucket list, the retention window, and a count
+of pending jobs (every job scanned so far, since none has been published yet).
+A `configuration error:` line here means the file is wrong; fix it before going
+on. The one it refuses outright is a destination that overlaps the source tree
+— publishing a tree into itself would let the retention sweep delete the
+published copy.
+
+### 11.2 Install the units
+
+```sh
+sudo cp publisher/systemd/email-guard-publisher.path    /etc/systemd/system/
+sudo cp publisher/systemd/email-guard-publisher.service /etc/systemd/system/
+sudo cp publisher/systemd/email-guard-publisher.timer   /etc/systemd/system/
+sudo cp publisher/systemd/email-guard-cleanup.service   /etc/systemd/system/
+sudo cp publisher/systemd/email-guard-cleanup.timer     /etc/systemd/system/
+```
+
+**Then edit the absolute paths inside them.** systemd cannot expand the
+`EnvironmentFile` into unit *directives*, so three of them are literal and must
+match this host:
+
+- `PathModified=` in `email-guard-publisher.path` — three lines, one per bucket,
+  under your real `data/outbound`;
+- `ReadWritePaths=` in `email-guard-publisher.service` — the outbound tree and
+  the partition;
+- `ReadWritePaths=` in `email-guard-cleanup.service` — the outbound tree, and
+  deliberately **not** the partition.
+
+Also check `User=` / `Group=` (1000 by default, matching `EMAIL_GUARD_UID`) and
+`WorkingDirectory=` / `PYTHONPATH=` (`/opt/email-guard` and its `publisher/`
+subdirectory). Then:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now email-guard-publisher.path
+sudo systemctl enable --now email-guard-publisher.timer
+sudo systemctl enable --now email-guard-cleanup.timer
+
+systemctl list-timers 'email-guard-*'
+systemctl status email-guard-publisher.path
+```
+
+Nothing is pip-installed and no image is rebuilt: the publisher is stdlib-only
+and runs straight from the checkout.
+
+### 11.3 Prove one job crosses
+
+```sh
+# drain whatever is already pending
+sudo systemctl start email-guard-publisher.service
+journalctl -u email-guard-publisher.service -n 30 --no-pager
+```
+
+Expect a line per job (`published cleared/<job> -> /mnt/network/acheron/...`)
+and a summary. Then check both sides:
+
+```sh
+# the package landed, at the deterministic path
+ls /mnt/network/acheron/email-guard/cleared/<job>/
+
+# the local job is marked, and unchanged otherwise
+ls -a data/outbound/cleared/<job>/
+cat  data/outbound/cleared/<job>/.published
+```
+
+Three things to confirm, and each is a promise to the consumer:
+
+1. **The package is clean.** The destination has `report.json`, `message.eml`
+   and the attachments — and **no** `.complete` or `.published`. Those markers
+   are ours and stay on this host.
+2. **The path is deterministic.** `<bucket>/<job>`, the same slug as locally.
+   Smiley can construct it from the bucket and the job id.
+3. **Nothing local was removed.** The job directory still has everything it had,
+   plus `.published` naming where the copy went.
+
+### 11.4 Prove the latency, then prove it does not depend on the event
+
+Send a test message and watch:
+
+```sh
+journalctl -u email-guard-publisher.service -f
+```
+
+The job should publish within a second or two of the scan finishing — that is
+the `.path` unit firing on the new job directory.
+
+Now the honest part. systemd path units do not recurse, so the unit watches the
+three **bucket** directories; creating a job directory is the event, and that
+happens a fraction of a second *before* the `.complete` sentinel inside it. So a
+fire can arrive too early, find nothing publishable, and exit — which is why
+`email-guard-publisher.timer` exists. Prove the backstop works on its own:
+
+```sh
+sudo systemctl stop email-guard-publisher.path     # no events at all
+# ... send a message, wait for the scan ...
+sleep 330                                          # the timer runs every 5 minutes
+ls /mnt/network/acheron/email-guard/cleared/ | tail -3
+sudo systemctl start email-guard-publisher.path
+```
+
+The job must still have crossed. Latency comes from the path unit; the guarantee
+comes from the timer. Run both.
+
+### 11.5 Prove an outage loses nothing
+
+This is the check worth doing properly, because it is the one that costs mail if
+it is wrong.
+
+```sh
+# simulate the share going away
+sudo umount /mnt/network/acheron        # or: pull the network, stop the NAS
+
+# ... send two or three messages, let them scan ...
+sudo systemctl start email-guard-publisher.service
+journalctl -u email-guard-publisher.service -n 5 --no-pager
+```
+
+Expect a **warning**, not a failure: `destination ... is not reachable -- N
+job(s) stay local and will be retried on the next fire`. Confirm the unit did
+not go into a failed state (`systemctl status` shows the last run as successful)
+— a NAS reboot is an expected state of the world, not an incident to page for.
+
+Then confirm nothing was lost or half-done:
+
+```sh
+ls -a data/outbound/cleared/*/ | grep -c '\.published'    # no new markers
+sudo systemctl start email-guard-cleanup.service          # retention, mid-outage
+ls data/outbound/cleared/ | wc -l                         # unchanged
+```
+
+The retention sweep must delete **nothing**: an unpublished job is never
+expired, however old it is. That rule is what turns a week-long outage into a
+week of disk usage instead of a week of lost mail.
+
+Bring the mount back and watch the backlog drain by itself:
+
+```sh
+sudo mount /mnt/network/acheron
+sudo systemctl start email-guard-publisher.service
+ls /mnt/network/acheron/email-guard/cleared/ | wc -l
+```
+
+### 11.6 Prove a consumer never sees half a job
+
+The copy is assembled in a dot-prefixed staging directory *inside the
+destination bucket*, and the final step is a single `rename` — atomic within one
+filesystem. To see it, watch the bucket while a large attachment crosses:
+
+```sh
+# in one shell
+while :; do ls /mnt/network/acheron/email-guard/cleared/; sleep 0.1; done
+```
+
+Job directories appear complete, in one step. A `.publishing-<job>.<pid>` entry
+may flash by; it is dot-prefixed and is never named like a job, so a consumer
+listing the bucket skips it as a hidden entry.
+
+If the destination turns out **not** to be the same filesystem as the staging
+directory (it always is — staging is inside it), the rename would fail rather
+than silently degrade to a copy, and the job would stay pending.
+
+### 11.7 Prove retention, without waiting fourteen days
+
+Back-date a published job's marker and run the sweep:
+
+```sh
+job=data/outbound/cleared/<some-published-job>
+sudo -u '#1000' touch -d '30 days ago' $job/.published
+sudo systemctl start email-guard-cleanup.service
+journalctl -u email-guard-cleanup.service -n 5 --no-pager
+ls $job                                    # gone
+ls /mnt/network/acheron/email-guard/cleared/<some-published-job>/   # still there
+```
+
+Both halves matter: the local copy expires, and **the published copy does not**.
+The cleanup unit is not even given the partition in its `ReadWritePaths`, so
+that second line is enforced by systemd, not only by the code.
+
+### 11.8 The Smiley side
+
+Nothing to install here — Smiley is triggered by the **existing n8n webhook**,
+unchanged. Two things to tell whoever maintains it:
+
+- **The file may land a beat after the webhook.** The dispatcher POSTs as soon as
+  the scan returns; the publisher fires on the job directory appearing. The gap
+  is normally well under a second, but it is a race. Treat the webhook as "a job
+  is coming" and retry the path briefly rather than treating a missing directory
+  as an error.
+- **The path is `/mnt/network/acheron/email-guard/<bucket>/<job>/`**, built from
+  the `bucket` and `written.job` fields the webhook payload already carries.
+  Verify attachments against `extracted_attachments` in `report.json` — it has
+  the SHA-256 and size of every file beside it — and ignore any entry whose name
+  starts with a dot.
 
 ---
 
@@ -1059,6 +1367,79 @@ The service exits rather than retrying on purpose: nothing inside the container
 can fix an ownership problem on the host, and a loop would only bury the line
 that names the fix.
 
+### Nothing is published, and the publisher unit looks fine
+
+**Symptom.** `data/outbound` fills up, `/mnt/network/acheron/email-guard` stays
+empty, and `systemctl status email-guard-publisher.service` shows a clean run.
+
+Work down this list; each step distinguishes a different cause.
+
+```sh
+# 1. WHAT does it think it is doing? Wrong paths are the usual answer.
+sudo -u '#1000' env $(grep -v '^#' /etc/email-guard/publisher.env | xargs) \
+     PYTHONPATH=/opt/email-guard/publisher \
+     python3 -m email_guard_publisher status
+```
+
+- **`pending 0 job(s)` while jobs exist.** It is looking at the wrong tree, or
+  the jobs have no `.complete`. Check `EMAIL_GUARD_OUTBOUND_DIR` is the **host**
+  path (`${EMAIL_GUARD_HOST_ROOT}/data/outbound`) and not `/app/data/outbound`;
+  then `ls -a data/outbound/*/*/ | grep complete`. A missing sentinel on a job
+  that otherwise looks finished means the scanner image predates this feature —
+  rebuild it (§10.7).
+- **`pending N` but nothing crosses.** Read the journal: `destination ... is not
+  reachable` means the mount is gone or uid 1000 cannot write it
+  (`sudo -u '#1000' test -w /mnt/network/acheron/email-guard`). A per-job
+  exception means a real copy error, and the job stays pending by design.
+- **The status command works but the unit does nothing.** The unit is not
+  reading the same environment: check `systemctl show -p Environment -p
+  EnvironmentFiles email-guard-publisher.service`, and that
+  `/etc/email-guard/publisher.env` is readable by the unit's user.
+
+**The events never arrive, but a manual start works.** That is the path unit,
+not the publisher. `systemctl status email-guard-publisher.path` and confirm the
+`PathModified=` lines name directories that **exist** — a path unit watching a
+missing directory sits there quietly. The bucket directories are created by the
+first message routed to them, so on a fresh host `data/outbound/rejected` may
+not exist yet; create the three by hand. Until then, the backstop timer is what
+is publishing, five minutes at a time.
+
+### Jobs are published but never expire
+
+**Symptom.** `.published` markers everywhere, `data/outbound` growing without
+bound, and the cleanup timer showing as active.
+
+```sh
+systemctl list-timers 'email-guard-*'
+journalctl -u email-guard-cleanup.service -n 20 --no-pager
+```
+
+The log line names all three counts. `kept N unpublished` means those jobs never
+crossed — that is the publisher's problem, above, and retention is correctly
+refusing to delete them. `kept N within the window` with a retention you thought
+was smaller means the unit is reading a different `EMAIL_GUARD_OUTBOUND_RETENTION_DAYS`
+than you edited; `systemctl show -p EnvironmentFiles email-guard-cleanup.service`.
+Remember the age is counted from the `.published` marker's mtime — the moment the
+job was *published*, not scanned — so a backlog that drained yesterday gets its
+full window from yesterday.
+
+### Smiley sees a job directory before its files
+
+**Symptom.** The consumer reports a job with a missing `report.json` or a
+missing attachment.
+
+This should be impossible for a published job: the package is assembled in a
+staging directory and renamed into place in one atomic step. Two things to check
+before looking anywhere else:
+
+- **Is the consumer reading the staging directory?** It is dot-prefixed
+  (`.publishing-<job>.<pid>`) and never named like a job. A consumer that
+  globs `*` and does not skip hidden entries will occasionally catch one
+  mid-copy. Skip dot-prefixed entries.
+- **Is something else writing into the destination?** The publisher is the only
+  thing that should. A second copy of it — an old cron job, a manual `rsync` —
+  breaks the guarantee by writing files directly.
+
 ### Orphaned containers after a hard kill
 
 By design: `--rm` only fires on a clean exit, so a dispatcher killed mid-scan
@@ -1101,3 +1482,22 @@ Even a clean run of this runbook leaves these untested by anything in the repo:
 - **Whether 24h is the right interval.** It is a guess. The feed is the part
   that wants updating often, and nothing here yet measures how quickly a new
   signature ought to reach a running deployment.
+- **The publisher against a real network filesystem.** Every test runs against
+  two tmp directories, which model a local filesystem exactly and a NFS/CIFS
+  share only approximately. The rename is atomic on both, but the failure modes
+  are not the same: a *stale* mount can pass the reachability check and fail
+  mid-copy (handled — the job stays pending), and some servers are lax about
+  `fsync` on a directory. Watch the first week of journal output.
+- **A rename onto a destination another writer is touching.** The publisher
+  assumes it is the only thing writing under `${DEST}`. Two hosts publishing
+  into one share, or a manual `rsync` into it, is untested and outside the
+  design.
+- **The path-unit race, quantified.** The window between a job directory
+  appearing and its sentinel being written is small enough that the early fire
+  is expected to be rare, but nothing measures how often it actually happens on
+  a busy mailbox. It costs latency only — the backstop timer publishes anything
+  the event missed — but if the journal shows the backstop doing most of the
+  work, the event path is worth revisiting.
+- **Smiley's side of the contract.** That a job directory appears whole is
+  tested here; that the consumer *retries* when the file lands a beat after the
+  webhook is a property of that machine, and can only be confirmed there.

@@ -1,0 +1,34 @@
+# The backstop behind email-guard-publisher.path.
+#
+# The path unit is what makes publishing feel instant, but it is event-shaped,
+# and events can be missed:
+#
+#   * a job directory is created a fraction of a second before the `.complete`
+#     sentinel inside it, so the fire it triggers may arrive too early (the
+#     publisher correctly skips the job, and nothing else fires for it);
+#   * the destination may have been unreachable when the event arrived;
+#   * the host may have been rebooting, or the unit not yet enabled.
+#
+# So the guarantee is split in two: the path unit provides latency, this timer
+# provides certainty. Every finished job is published within five minutes even
+# if no event ever fires for it, and a backlog that built up during an outage
+# drains on its own without anyone touching the machine.
+#
+# Five minutes is cheap: a run with nothing to do lists three directories and
+# exits.
+
+[Unit]
+Description=Backstop sweep for unpublished Email Guard jobs
+Documentation=file:/opt/email-guard/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=email-guard-publisher.service
+# Do not stampede if several timers come due together after a resume.
+RandomizedDelaySec=30s
+# Catch up after downtime rather than waiting for the next slot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

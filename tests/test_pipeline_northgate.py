@@ -27,6 +27,7 @@ VERDICT_KEYS = {
     "links",
     "attachments",
     "canary",
+    "extracted_attachments",
     "proposed_action",
     "proposal",
     "written",

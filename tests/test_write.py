@@ -94,6 +94,10 @@ def test_message_lands_in_its_bucket(write, outputs, fixture, bucket, copy_name)
     assert written_files(outputs["outbound"]) == {
         f"{bucket}/{verdict['written']['job']}/report.json",
         f"{bucket}/{verdict['written']['job']}/{copy_name}",
+        # The sentinel is part of every job directory, in every bucket: it says
+        # "this job is fully written", not "this job cleared". None of these
+        # fixtures carries an attachment. See tests/test_attachments.py.
+        f"{bucket}/{verdict['written']['job']}/.complete",
     }
 
     report = json.loads((job_dir / "report.json").read_text(encoding="utf-8"))

@@ -1,0 +1,50 @@
+# Local retention: delete job directories that are published AND old.
+#
+# Started by email-guard-cleanup.timer, once a day. It deletes nothing that is
+# not already on the network partition, whatever its age -- so a long outage
+# costs local disk and never costs mail.
+#
+# It never touches the destination. Note the ReadWritePaths below: this unit is
+# not given acheron at all, so "never deletes the published copy" is enforced by
+# the kernel here, not only by the code.
+
+[Unit]
+Description=Expire published Email Guard jobs from local disk
+Documentation=file:/opt/email-guard/README.md
+
+[Service]
+Type=oneshot
+
+# The same user as the publisher: it owns the local outbound tree.
+User=1000
+Group=1000
+
+# The same EnvironmentFile as the publisher, so the source tree and the
+# retention window are configured in exactly one place.
+EnvironmentFile=/etc/email-guard/publisher.env
+
+WorkingDirectory=/opt/email-guard
+Environment=PYTHONPATH=/opt/email-guard/publisher
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m email_guard_publisher cleanup
+
+TimeoutStartSec=30min
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# The local outbound tree, and NOTHING else. Deliberately no acheron path.
+ReadWritePaths=/opt/email-guard/data/outbound

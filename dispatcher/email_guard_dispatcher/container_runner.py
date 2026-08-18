@@ -93,6 +93,12 @@ CONTAINER_LISTS = "/data/lists"
 CONTAINER_OUTBOUND = "/data/outbound"
 CONTAINER_DAILY_BRIEF = "/data/daily-brief"
 
+# The scanner's "safe to publish" sentinel, which `_merge_tree` must move LAST.
+# Named here rather than imported: the dispatcher imports nothing from the
+# scanner -- the subprocess boundary is the whole interface (see pyproject.toml)
+# -- so this is a one-word contract, asserted in tests/test_container_runner.py.
+COMPLETE_NAME = ".complete"
+
 DEFAULT_IMAGE = "email-guard-scanner:0.1.0"
 DEFAULT_LABEL_NAMESPACE = "email-guard"
 DEFAULT_NAME_PREFIX = "email-guard-scan-"
@@ -557,10 +563,19 @@ def _merge_tree(source: Path, destination: Path) -> None:
     scanner stay an opaque unit. Overwriting is correct -- the scanner rewrites
     its own files identically on a rescan, so a collision is the same message
     scanned twice.
+
+    ONE exception to the blindness, and it is not optional. The scanner writes
+    `.complete` into a job directory last, and that ordering is what tells the
+    host-side publisher a job may be copied to the network partition. This move
+    re-creates the tree in the shared store file by file, so it re-creates the
+    ordering too -- and plain alphabetical order puts `.complete` FIRST (`.`
+    sorts below every letter), which would advertise a job directory holding
+    nothing but its sentinel. Sentinels therefore move after everything else.
+    See `email_guard.route.COMPLETE_NAME` and `publisher/`.
     """
     if not source.is_dir():
         return
-    for entry in sorted(source.rglob("*")):
+    for entry in _merge_order(source):
         target = destination / entry.relative_to(source)
         if entry.is_dir():
             target.mkdir(parents=True, exist_ok=True)
@@ -573,6 +588,14 @@ def _merge_tree(source: Path, destination: Path) -> None:
             # happen -- the spool lives under the data root -- but a copy is
             # always available as a fallback.
             shutil.move(str(entry), str(target))
+
+
+def _merge_order(source: Path) -> list[Path]:
+    """Everything under ``source``, with completion sentinels moved to the end."""
+    entries = sorted(source.rglob("*"))
+    return [entry for entry in entries if entry.name != COMPLETE_NAME] + [
+        entry for entry in entries if entry.name == COMPLETE_NAME
+    ]
 
 
 def _remove_tree(path: Path) -> None:

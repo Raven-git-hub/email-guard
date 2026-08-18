@@ -1,0 +1,43 @@
+# Fires the publisher when a job directory appears in the outbound tree.
+#
+#   sudo cp publisher/systemd/*.path *.service *.timer /etc/systemd/system/
+#   sudo systemctl enable --now email-guard-publisher.path
+#
+# WHAT IT WATCHES, AND WHY IT IS THE BUCKET AND NOT THE JOB
+#
+# systemd path units watch ONE path each, and they do not recurse. A job's
+# `.complete` sentinel is written two levels down -- outbound/<bucket>/<job>/ --
+# which no single watch can see. What IS visible at this level is the creation
+# of the job directory itself: `mkdir outbound/cleared/<job>` modifies
+# `outbound/cleared`, and PathModified fires.
+#
+# That gives a near-instant trigger and one honest gap: the directory appears
+# fractionally before the sentinel inside it, so this fire may find the job
+# still being written. The publisher skips a job with no `.complete` -- always,
+# by design -- so the effect is a wasted run, not a partial publish. The NEXT
+# fire (the next message, or the backstop timer below) picks the job up.
+#
+# email-guard-publisher.timer is therefore not optional decoration: it is what
+# turns "usually within a second" into "always, eventually". Install both.
+#
+# Adjust these three paths if EMAIL_GUARD_OUTBOUND_DIR is not the default. They
+# cannot read the EnvironmentFile -- unit *directives* are not environment
+# expansions -- so this is the one place a path is repeated, and the one thing
+# to change when the tree moves.
+
+[Unit]
+Description=Watch the Email Guard outbound tree for finished jobs
+Documentation=file:/opt/email-guard/README.md
+
+[Path]
+PathModified=/opt/email-guard/data/outbound/cleared
+PathModified=/opt/email-guard/data/outbound/flagged
+PathModified=/opt/email-guard/data/outbound/rejected
+
+# The service started on each event. Named explicitly rather than relying on the
+# implicit `<same name>.service`, so renaming one unit cannot silently unhook
+# the other.
+Unit=email-guard-publisher.service
+
+[Install]
+WantedBy=multi-user.target

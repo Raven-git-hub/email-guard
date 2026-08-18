@@ -1,0 +1,85 @@
+# The HOST-side bridge: local job directories -> /mnt/network/acheron.
+#
+# This is the ONLY component in Email Guard that touches the network partition.
+# The scanner and dispatcher containers have no mount for it and no route to it;
+# that separation is the point of the whole design, and it is why this runs as a
+# plain systemd service on the host rather than as a fifth container.
+#
+# Triggered by email-guard-publisher.path (near-instant, on each new job) and by
+# email-guard-publisher.timer (the backstop). Both start this same unit, and
+# systemd will not run two copies of it at once -- a Type=oneshot service that is
+# already running simply absorbs the new trigger, so a burst of mail cannot
+# start a race for the same job.
+
+[Unit]
+Description=Publish finished Email Guard jobs to the acheron partition
+Documentation=file:/opt/email-guard/README.md
+
+# Do not even try while the partition is not mounted. The publisher handles an
+# unreachable destination gracefully (it logs and leaves everything local), so
+# this is an optimisation, not a safety net -- and it is a `Wants`, not a
+# `Requires`, so a mount that is slow to come back does not fail the unit.
+#
+# Adjust or drop the mount name to match the host: systemd derives it from the
+# mount point, so /mnt/network/acheron is mnt-network-acheron.mount.
+Wants=mnt-network-acheron.mount
+After=mnt-network-acheron.mount
+
+[Service]
+Type=oneshot
+
+# Not root. This user needs exactly two things: read+write on the outbound tree
+# (it writes the .published marker there) and read+write on the destination. On
+# cerberus that is the same uid the containers run as -- EMAIL_GUARD_UID in
+# .env, 1000 by default -- so the tree stays editable by hand and no file
+# changes owner when it is published.
+User=1000
+Group=1000
+
+# Every path and the retention window live here, in one file both units read.
+# Copy publisher.env.sample to it and edit that; nothing is hardcoded in the
+# Python.
+EnvironmentFile=/etc/email-guard/publisher.env
+
+# Run from the checkout. The publisher is stdlib-only and is NOT pip-installed
+# on the host: no virtualenv, no dependency that could drift from the
+# containers'. WorkingDirectory puts `publisher/` on the import path via
+# PYTHONPATH below.
+WorkingDirectory=/opt/email-guard
+Environment=PYTHONPATH=/opt/email-guard/publisher
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m email_guard_publisher publish
+
+# A slow network share must not wedge the unit forever; the next fire retries.
+TimeoutStartSec=15min
+
+# Hardening. This process copies bytes between two directories and needs
+# nothing else -- no network, no new privileges, no devices, no home
+# directories, and a read-only view of everything except the two trees named in
+# ReadWritePaths.
+#
+# NOTE: ReadWritePaths must name the real paths for THIS host. They cannot read
+# the EnvironmentFile, so if you move either tree, move these too.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/opt/email-guard/data/outbound /mnt/network/acheron/email-guard
+
+# PrivateNetwork=true is safe for a LOCAL mount (the kernel holds the NFS/CIFS
+# connection, not this process) and is a real reduction: a bug here cannot
+# become an outbound connection. If the destination is reached by a userspace
+# filesystem instead -- sshfs, rclone mount -- comment it out, because those DO
+# need the network namespace.

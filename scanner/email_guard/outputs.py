@@ -45,6 +45,14 @@ def build_verdict(
         "links": list(message.get("links") or []),
         "attachments": list(message.get("attachments") or []),
         "canary": canary_result,
+        # The attachments actually written to the job directory, filled in by
+        # the output stage: one entry per file, with the sender's original
+        # name, the sanitised name it was stored under, its type, size and
+        # SHA-256. Empty for a quarantined message (nothing is materialised)
+        # and for a `--dry-run` (nothing is written at all). Distinct from
+        # `attachments` above, which is what the MESSAGE claims -- this is what
+        # is on disk. See `email_guard.attachments`.
+        "extracted_attachments": [],
         # TODO(actions): `cleared` mail carries an action (finance,
         # personal_assistant, work, calendar, summarise) for the downstream
         # webhook. Not yet in the greylist schema -- root README, "Actions".
