@@ -1266,12 +1266,18 @@ scanner container ──writes──▶ data/outbound/<bucket>/<job>/        (lo
 
 What the consumer is promised, and may build on:
 
-- **A job appears whole, or not at all.** The copy is assembled in a dot-prefixed staging
-  directory *inside the destination bucket* — the same filesystem — and the final step is a
-  single `rename`, which POSIX makes atomic. A consumer scanning the bucket mid-copy sees
-  either nothing or a complete package. It never sees a half-written `report.json`, and never
-  an attachment arriving after the report that describes it. Ignore dot-prefixed entries when
-  listing a bucket and there is nothing else to guard against.
+- **A job appears whole, or not at all.** The copy is assembled in a staging directory
+  *inside the destination bucket* — the same filesystem — and the final step is a single
+  `rename`, which POSIX makes atomic. Under the real `<job>` name a consumer therefore sees
+  either nothing or a complete package: never a half-written `report.json`, never an
+  attachment arriving after the report that describes it.
+
+  The staging directory is named `publishing-<job>.<pid>`, and it is **not** hidden — it
+  cannot be. Acheron is a CIFS/SMB share whose server refuses to create any name beginning
+  with a dot, so a dot-prefixed staging directory means the first `mkdir` fails and *nothing*
+  publishes at all. Nothing about the guarantee rested on hiding it: the rename is what makes
+  a package appear atomically under its real name. A consumer that lists a bucket rather than
+  resolving the job path should **skip entries starting with `publishing-`**.
 - **The path is deterministic:** `/mnt/network/acheron/email-guard/<bucket>/<job>/`, where
   `<bucket>` is `cleared` / `flagged` / `rejected` and `<job>` is the same job slug the
   scanner used. Given the bucket and the job id, the path can be constructed. Nothing is

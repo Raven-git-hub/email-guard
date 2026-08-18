@@ -198,9 +198,12 @@ def test_a_consumer_scanning_mid_copy_never_sees_a_partial_job(settings, trees, 
     """The promise, tested by looking at the destination from inside the copy.
 
     The copy is intercepted after each file lands. At every one of those
-    moments, a consumer listing the destination bucket for job directories must
-    find either nothing or a complete package -- never the growing staging
-    directory, which is not named like a job.
+    moments, the real ``<job>`` name must not exist yet: it appears in one step,
+    at the rename. That -- not hiding the staging directory -- is what the
+    guarantee rests on. The staging directory IS visible while the copy runs
+    (it cannot be hidden; see `test_the_staging_prefix_is_never_dot_prefixed`),
+    so a consumer that scans the bucket skips entries carrying its prefix, the
+    same way it would skip any work-in-progress name.
     """
     observations: list[set[str]] = []
     real_copy_file = publish_module._copy_file
@@ -212,7 +215,7 @@ def test_a_consumer_scanning_mid_copy_never_sees_a_partial_job(settings, trees, 
             {
                 entry.name
                 for entry in bucket.iterdir()
-                if not entry.name.startswith(".")
+                if not entry.name.startswith(STAGING_PREFIX)
             }
         )
 
@@ -228,6 +231,92 @@ def test_a_consumer_scanning_mid_copy_never_sees_a_partial_job(settings, trees, 
     assert observations, "the copy never ran"
     assert all(seen == set() for seen in observations), observations
     assert names_in(trees["dest"] / "cleared") == {"job-0001"}
+
+
+def test_the_partial_package_is_never_under_the_real_job_name(settings, trees, monkeypatch):
+    """The same promise, stated without reference to what the staging is called.
+
+    Whatever the staging directory is named, ``<bucket>/<job>`` must not exist
+    until it is complete -- so a consumer that resolves the deterministic path
+    (which is what Smiley does, from the webhook) either misses or gets
+    everything.
+    """
+    seen: list[bool] = []
+    real_copy_file = publish_module._copy_file
+
+    def observing_copy(source: Path, target: Path) -> None:
+        real_copy_file(source, target)
+        seen.append((trees["dest"] / "cleared" / "job-0001").exists())
+
+    monkeypatch.setattr(publish_module, "_copy_file", observing_copy)
+
+    make_job(trees["source"], "job-0001", attachments={"receipt.png": ATTACHMENT})
+    publish(settings)
+
+    assert seen, "the copy never ran"
+    assert not any(seen), "the job path existed before the rename"
+    assert (trees["dest"] / "cleared" / "job-0001" / "report.json").is_file()
+
+
+def test_the_staging_prefix_is_never_dot_prefixed():
+    """Regression: acheron is SMB, and its server rejects leading-dot names.
+
+    Confirmed on the host -- ``mkdir with.dots`` succeeds on
+    ``//192.168.1.71/acheron``, ``mkdir .anything`` fails with ENOENT. The
+    staging directory is created ON THE SHARE, so a dot-prefixed prefix made the
+    first ``mkdir`` raise ``FileNotFoundError`` and NO job ever published, on
+    every run, silently as far as the destination was concerned.
+
+    The internal markers keep their leading dots deliberately: they are written
+    only to the LOCAL outbound tree, which is ext4. The asymmetry is the point,
+    so both halves are asserted here.
+    """
+    assert not STAGING_PREFIX.startswith("."), (
+        "the acheron SMB share refuses to create leading-dot names -- a "
+        "dot-prefixed staging directory means nothing is ever published"
+    )
+    assert STAGING_PREFIX, "the staging directory still needs a distinguishing prefix"
+    assert COMPLETE.startswith(".") and PUBLISHED.startswith("."), (
+        "the markers are local-only (ext4) and stay hidden"
+    )
+
+
+def test_nothing_that_reaches_the_share_starts_with_a_dot(settings, trees, tmp_path, lists, pack):
+    """The same SMB constraint, applied to everything the publisher copies.
+
+    The staging prefix was the name this bug surfaced under, but any leading-dot
+    name created on the share fails the same way -- so this walks a real scanned
+    job, attachment names and all, and asserts every name that lands is dot-free.
+    The sanitiser is what guarantees it for attachments (`.hidden.pdf` is stored
+    as `hidden.pdf`) and `job_slug` for the directory; this is the test that
+    would catch either of them relaxing.
+    """
+    from email_guard import parse
+    from email_guard.pipeline import scan_and_write
+    from email_guard.route import SourceMessage
+
+    from tests.test_attachments import PNG_BYTES, build_eml
+
+    outbound = trees["source"]
+    raw = build_eml([(".hidden.pdf", PNG_BYTES, "application", "pdf")])
+    scan_and_write(
+        parse.parse_eml(raw),
+        lists,
+        pack,
+        SourceMessage.from_eml(raw),
+        outbound_dir=outbound,
+        daily_brief_dir=tmp_path / "daily-brief",
+        job_id="test-job",
+    )
+
+    assert publish(settings).published, "the job never published"
+
+    landed = [path for path in trees["dest"].rglob("*")]
+    assert landed, "nothing reached the destination"
+    for path in landed:
+        assert not path.name.startswith("."), (
+            f"{path} would fail to create on the acheron SMB share"
+        )
 
 
 def test_the_staging_directory_lives_inside_the_destination(settings, trees, monkeypatch):
@@ -246,7 +335,11 @@ def test_the_staging_directory_lives_inside_the_destination(settings, trees, mon
 
     assert len(seen) == 1
     assert seen[0].parent == trees["dest"] / "cleared"
+    # The prefix comes from markers.py, which is the single source of truth --
+    # never spelled out here, so the constant cannot be changed in one place
+    # only.
     assert seen[0].name.startswith(STAGING_PREFIX)
+    assert seen[0].name != "job-0001"
 
 
 def test_the_final_step_is_a_rename(settings, trees, monkeypatch):

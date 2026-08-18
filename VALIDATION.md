@@ -1034,18 +1034,23 @@ ls /mnt/network/acheron/email-guard/cleared/ | wc -l
 
 ### 11.6 Prove a consumer never sees half a job
 
-The copy is assembled in a dot-prefixed staging directory *inside the
-destination bucket*, and the final step is a single `rename` — atomic within one
-filesystem. To see it, watch the bucket while a large attachment crosses:
+The copy is assembled in a staging directory *inside the destination bucket*,
+and the final step is a single `rename` — atomic within one filesystem. To see
+it, watch the bucket while a large attachment crosses:
 
 ```sh
 # in one shell
 while :; do ls /mnt/network/acheron/email-guard/cleared/; sleep 0.1; done
 ```
 
-Job directories appear complete, in one step. A `.publishing-<job>.<pid>` entry
-may flash by; it is dot-prefixed and is never named like a job, so a consumer
-listing the bucket skips it as a hidden entry.
+Job directories appear complete, in one step, under their real name. A
+`publishing-<job>.<pid>` entry may flash by while a copy is in flight — that is
+the staging directory, and it is **visible on purpose**: this share is CIFS/SMB
+and its server refuses to create any name beginning with a dot, so it cannot be
+hidden (a `.publishing-` prefix made the first `mkdir` fail with ENOENT and
+nothing published at all). The guarantee never depended on hiding it; it depends
+on the rename. A consumer that lists the bucket instead of resolving the job
+path should skip `publishing-*`.
 
 If the destination turns out **not** to be the same filesystem as the staging
 directory (it always is — staging is inside it), the rename would fail rather
@@ -1080,9 +1085,12 @@ unchanged. Two things to tell whoever maintains it:
   as an error.
 - **The path is `/mnt/network/acheron/email-guard/<bucket>/<job>/`**, built from
   the `bucket` and `written.job` fields the webhook payload already carries.
-  Verify attachments against `extracted_attachments` in `report.json` — it has
-  the SHA-256 and size of every file beside it — and ignore any entry whose name
-  starts with a dot.
+  Resolving that path directly — rather than scanning the bucket — is the
+  intended access pattern, and it needs no filtering at all: the directory
+  appears atomically under that exact name. Verify attachments against
+  `extracted_attachments` in `report.json`, which carries the SHA-256 and size
+  of every file beside it. A consumer that *does* list a bucket should skip
+  entries starting with `publishing-` — those are copies in flight.
 
 ---
 
@@ -1432,10 +1440,11 @@ This should be impossible for a published job: the package is assembled in a
 staging directory and renamed into place in one atomic step. Two things to check
 before looking anywhere else:
 
-- **Is the consumer reading the staging directory?** It is dot-prefixed
-  (`.publishing-<job>.<pid>`) and never named like a job. A consumer that
-  globs `*` and does not skip hidden entries will occasionally catch one
-  mid-copy. Skip dot-prefixed entries.
+- **Is the consumer reading the staging directory?** It is named
+  `publishing-<job>.<pid>` and is **not** hidden — the SMB server backing this
+  share rejects leading-dot names, so it cannot be. A consumer that globs `*`
+  will occasionally catch one mid-copy. Resolve the job path from the webhook
+  instead, or skip `publishing-*`.
 - **Is something else writing into the destination?** The publisher is the only
   thing that should. A second copy of it — an old cron job, a manual `rsync` —
   breaks the guarantee by writing files directly.
@@ -1483,11 +1492,19 @@ Even a clean run of this runbook leaves these untested by anything in the repo:
   that wants updating often, and nothing here yet measures how quickly a new
   signature ought to reach a running deployment.
 - **The publisher against a real network filesystem.** Every test runs against
-  two tmp directories, which model a local filesystem exactly and a NFS/CIFS
-  share only approximately. The rename is atomic on both, but the failure modes
-  are not the same: a *stale* mount can pass the reachability check and fail
-  mid-copy (handled — the job stays pending), and some servers are lax about
-  `fsync` on a directory. Watch the first week of journal output.
+  two tmp directories, which model a local filesystem exactly and a CIFS/SMB
+  share only approximately. One difference has already bitten: **this share
+  refuses to create any name beginning with a dot** (`mkdir with.dots` works,
+  `mkdir .anything` returns ENOENT), which meant the original
+  `.publishing-<job>.<pid>` staging directory failed on its first `mkdir` and
+  nothing published at all. The prefix is now `publishing-`, and
+  `tests/test_publisher.py` asserts both that it stays dot-free and that nothing
+  else the publisher copies to the share is dot-prefixed. The internal markers
+  keep their dots — they are only ever written to the local ext4 tree.
+
+  Still unproven on the real share: a *stale* mount, which can pass the
+  reachability check and fail mid-copy (handled — the job stays pending), and
+  whether the server honours `fsync` on a directory. Watch the journal.
 - **A rename onto a destination another writer is touching.** The publisher
   assumes it is the only thing writing under `${DEST}`. Two hosts publishing
   into one share, or a manual `rsync` into it, is untested and outside the

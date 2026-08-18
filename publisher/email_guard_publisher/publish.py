@@ -10,12 +10,21 @@ The whole design is three promises to the consumer and one to the operator.
 
 **A job directory appears whole, or not at all.** The copy is assembled in a
 staging directory *inside the destination bucket* -- same filesystem, so the
-final step is a single ``rename``, which POSIX guarantees is atomic. A consumer
-scanning the bucket sees either nothing, or a complete package. It never sees a
-half-copied report, and it never sees an attachment arrive after the report that
-describes it. (The staging directory is dot-prefixed so a consumer listing the
-bucket skips it as a hidden entry, but that is belt-and-braces: the point is
-that it is never *named* like a job.)
+final step is a single ``rename``, which POSIX guarantees is atomic. Under the
+real ``<job>`` name a consumer therefore sees either nothing or a complete
+package: never a half-copied report, never an attachment arriving after the
+report that describes it.
+
+The staging directory is named ``publishing-<job>.<pid>``, and it is deliberately
+NOT hidden. It cannot be: acheron is a CIFS/SMB share whose server refuses to
+create any name beginning with a dot, so the original ``.publishing-`` prefix
+made the first ``mkdir`` fail with ENOENT and nothing published at all (see
+:data:`~email_guard_publisher.markers.STAGING_PREFIX`). Nothing about the
+guarantee rested on hiding it. The rename is what makes a package appear
+atomically under its real name, and Smiley -- the primary consumer -- is
+webhook-triggered with the exact job name rather than scanning the bucket. A
+consumer that does scan should skip entries starting with the staging prefix,
+the same way it would skip any other work-in-progress name.
 
 **The path is deterministic.** ``${DEST}/<bucket>/<job>/`` -- the same bucket and
 the same job slug the scanner used locally, both already filesystem-safe. A
@@ -185,6 +194,11 @@ def publish_job(job: Job, dest_dir: Path) -> bool:
     # rename rather than a second copy: `os.rename` is atomic within one
     # filesystem and refuses to cross one. Staging in /tmp would silently
     # degrade to a copy, and a copy is exactly what must not be observable.
+    #
+    # The name comes from STAGING_PREFIX and must stay dot-free -- the SMB
+    # server backing acheron rejects leading-dot names outright, which is what
+    # broke the first version of this. The pid keeps two concurrent runs from
+    # assembling into one directory.
     staging = bucket_dir / f"{STAGING_PREFIX}{job.job}.{os.getpid()}"
     _remove(staging)
     try:
