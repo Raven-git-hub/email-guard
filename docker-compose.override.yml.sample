@@ -1,0 +1,36 @@
+# Deployment-specific compose wiring -- the half of the stack that cannot be
+# committed because it names networks that exist on ONE host.
+#
+# Copy this to `docker-compose.override.yml` and edit it for the host:
+#
+#     cp docker-compose.override.yml.sample docker-compose.override.yml
+#
+# Compose loads `docker-compose.override.yml` automatically when it sits beside
+# `docker-compose.yml`, so no `-f` flag is needed -- `docker compose up -d`
+# picks it up. The copy is git-ignored; this sample is the tracked record of
+# what the live file has to contain, so a fresh clone can reproduce it.
+#
+# WITHOUT this file the dispatcher comes up on `mail` and `dockerproxy` only,
+# both `internal: true`, and every webhook POST fails to resolve -- silently,
+# because delivery is best-effort. That is the failure this sample exists to
+# prevent. See README, "Optional webhook".
+
+services:
+  dispatcher:
+    # The base file's two, plus a route to the webhook target. Reaching n8n by
+    # its INTERNAL address (`http://n8n:5678/webhook/...`, set as
+    # EMAIL_GUARD_WEBHOOK_URL in `.env`) requires being on its network; the
+    # public hostname would round-trip through the edge and be eaten by the bot
+    # filter -- Cloudflare answers a container-issued POST with `error 1010`.
+    networks: [mail, dockerproxy, n8n]
+
+networks:
+  # DEPLOYMENT-SPECIFIC: `name` is the REAL docker network the n8n stack
+  # created on THIS host, and it differs per deployment -- compose derives it
+  # from the other stack's project directory, so it is `mail-net` here and
+  # `n8n_default` on a plain `n8n/` checkout. Find the right one with
+  # `docker network ls` before the first `up`; a wrong name fails the bring-up
+  # with "network not found", which is at least loud.
+  n8n:
+    external: true
+    name: mail-net

@@ -51,6 +51,13 @@ config/secrets.json
 # this deployment. The sample stays. ---
 .env
 
+# --- Compose override: the deployment-specific half of the stack. It names
+# networks that exist on ONE host (the dispatcher's route to the webhook
+# target), so the live file stays local and the sample beside it is the
+# tracked record of what it must contain. Rooted, so an override elsewhere in
+# the tree is not caught by accident. README, "Docker". ---
+/docker-compose.override.yml
+
 # The bridge's own certificate, if it is copied here for the dispatcher to
 # verify against. Not secret, but it is host-specific deployment state.
 config/bridge-cert.pem

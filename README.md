@@ -892,6 +892,11 @@ Both are **override patterns, not defaults**. The committed dispatcher reaches t
 the socket-proxy and nothing else; giving the process that handles hostile mail a route off
 the host is a decision to make deliberately, in a file that is not tracked.
 
+Not tracked, but not undocumented either: `docker-compose.override.yml.sample` holds shape
+(a) as this deployment actually runs it, and the bring-up steps under "Docker" copy it into
+place. The live file stays local because the external network name is host-specific — see
+that section for the copy-and-adjust step.
+
 ---
 
 ## Container runtime
@@ -1193,12 +1198,33 @@ The console is one service in the full stack:
 
 ```
 cp .env.sample .env && $EDITOR .env       # required paths and credentials
+cp docker-compose.override.yml.sample docker-compose.override.yml && $EDITOR docker-compose.override.yml
 docker compose --profile build build scanner
 docker compose build bridge dispatcher webui
 docker compose up -d                       # bridge + dispatcher + socket-proxy + webui
 ```
 
 `docker compose up -d webui` still brings up the console alone.
+
+**The override file is not optional on a host that runs the webhook.** Both tracked compose
+files describe the stack that is the same everywhere; the *deployment-specific* half — the
+dispatcher's route to the webhook target — lives in `docker-compose.override.yml`, which is
+git-ignored precisely because it names a network that exists on one host.
+`docker-compose.override.yml.sample` is the tracked record of what it has to contain, so a
+fresh clone can reproduce it rather than discovering the gap later.
+
+Compose **auto-loads** `docker-compose.override.yml` when it sits beside `docker-compose.yml`
+— no `-f` flag, nothing to remember at the call site — which is what makes this pattern safe
+and also what makes forgetting it quiet. After copying, **adjust the external network name
+for this host**: the sample joins the dispatcher to `mail`, `dockerproxy` and `n8n`, and
+declares `n8n` as an external network whose real name is `mail-net`. That name is derived by
+the *other* stack from its own project directory, so it differs per deployment — check
+`docker network ls` and set it before the first `up`.
+
+Skipping the copy brings up a dispatcher on `mail` and `dockerproxy` only, both
+`internal: true`. Scanning still works; every webhook POST fails to resolve, and since
+delivery is best-effort the notifications simply stop arriving. See "Optional webhook" for
+the two override shapes and why the internal address is the right one.
 
 **Deploying a console change.** The console's code — `webui/`, and the parts of the scanner
 package it imports in-process (`apply`, `lists`, `propose`, `config`) — is baked into the
