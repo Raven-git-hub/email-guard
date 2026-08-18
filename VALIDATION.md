@@ -55,6 +55,13 @@ refuses to start as root rather than quietly producing root sandboxes.
 If host port 8080 is already taken, set `EMAIL_GUARD_WEBUI_HOST_PORT` — only
 the host side moves, and the publication stays loopback-only either way.
 
+To reach the console from another machine on the LAN, set
+`EMAIL_GUARD_WEBUI_BIND=0.0.0.0` **and** `EMAIL_GUARD_WEBUI_TOKEN` in the same
+edit — the console reads mail and edits delivery rules over plain HTTP, and
+nothing in the container can enforce that pairing for you. Both stay in `.env`;
+neither is a reason to edit `docker-compose.yml`. Never expose it beyond the
+LAN.
+
 **No override file, no edits to tracked files.** A filled-in `.env` is the
 whole of the configuration; everything else is committed.
 

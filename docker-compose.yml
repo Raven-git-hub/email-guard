@@ -26,9 +26,12 @@
 # whole account re-login and keychain dance.
 #
 # The review console's exposure story is still two lines, still deliberately
-# adjacent: `EMAIL_GUARD_WEBUI_HOST: 0.0.0.0` binds the container's interface,
-# `127.0.0.1:8080:8080` publishes it to host loopback only. Drop the
-# `127.0.0.1:` prefix and the console is on the LAN.
+# adjacent: `EMAIL_GUARD_WEBUI_HOST: 0.0.0.0` binds the container's interface
+# (which is what lets a published port reach it at all), and the `ports:` entry
+# decides who can see it. That second line now takes its bind address from
+# `EMAIL_GUARD_WEBUI_BIND`, defaulting to `127.0.0.1` -- host loopback only.
+# Setting it to `0.0.0.0` puts the console on the LAN, and .env.sample states
+# the condition attached to doing that.
 
 services:
 
@@ -397,11 +400,26 @@ services:
       EMAIL_GUARD_RULES_CONTROL_TOKEN: "${EMAIL_GUARD_RULES_CONTROL_TOKEN:-}"
 
     ports:
-      # The container port stays 8080; only the HOST side is configurable, so
-      # the console can move out of the way of whatever else already has 8080.
-      # The `127.0.0.1:` prefix is not configurable, and is the whole exposure
-      # story -- drop it and this console is on the LAN.
-      - "127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080"
+      # The container port stays 8080. Both HOST-side halves are variables, and
+      # they are not equally consequential:
+      #
+      #   EMAIL_GUARD_WEBUI_HOST_PORT -- which port, so the console can move out
+      #     of the way of whatever else already has 8080. Harmless.
+      #   EMAIL_GUARD_WEBUI_BIND      -- which INTERFACE. This is the whole
+      #     exposure story of a console that reads mail and edits the rules
+      #     deciding what gets delivered, over plain HTTP.
+      #
+      # The default is `127.0.0.1` and it is deliberately baked in here rather
+      # than left to `.env`: an unset variable, a fresh clone, or a missing
+      # `.env` must all mean loopback-only. Exposure has to be an explicit,
+      # visible act -- `EMAIL_GUARD_WEBUI_BIND=0.0.0.0`, which .env.sample says
+      # requires EMAIL_GUARD_WEBUI_TOKEN -- never the fallback.
+      #
+      # (Previously this line hardcoded `127.0.0.1:`, which meant the one deploy
+      # that wanted LAN access hand-edited a tracked file and collided with
+      # every `git pull`. Parameterising it is what keeps the default honest:
+      # the drift is now a line in .env, where it belongs.)
+      - "${EMAIL_GUARD_WEBUI_BIND:-127.0.0.1}:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080"
 
     volumes:
       # The same data the dispatcher and the scanner use: the console reads the

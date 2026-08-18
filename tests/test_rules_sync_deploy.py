@@ -192,7 +192,7 @@ def test_the_console_keeps_the_default_network(compose: dict):
     """Naming only `rulesctl` would silently unpublish the console's port."""
     assert "default" in compose["services"]["webui"]["networks"]
     assert compose["services"]["webui"]["ports"] == [
-        "127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080"
+        "${EMAIL_GUARD_WEBUI_BIND:-127.0.0.1}:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080"
     ]
 
 

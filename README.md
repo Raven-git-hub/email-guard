@@ -1112,9 +1112,23 @@ over plain HTTP, with no password unless you configure one. The default bind is 
 and a non-loopback address is refused unless asked for twice — the host *and*
 `--allow-non-loopback` (or `EMAIL_GUARD_WEBUI_ALLOW_NON_LOOPBACK=1`). That flag exists for
 the container case, where the process must bind `0.0.0.0` for a published port to reach it
-and `docker-compose.yml` pins the publication to `127.0.0.1`. The host *port* is configurable
-(`EMAIL_GUARD_WEBUI_HOST_PORT`, default 8080) so the console can move out of the way of
-whatever else already has 8080; the loopback interface is not.
+at all, and the *publication* is what decides who can see it.
+
+Under compose, two variables shape that publication, and they are not equally consequential:
+`EMAIL_GUARD_WEBUI_HOST_PORT` (default 8080) moves the console out of the way of whatever
+else has that port, and **`EMAIL_GUARD_WEBUI_BIND` (default `127.0.0.1`) decides the
+interface**. Unset — a fresh clone, a missing `.env` — means loopback only; the default is
+baked into `docker-compose.yml` rather than left to `.env` precisely so that absence of
+configuration is never exposure.
+
+Setting `EMAIL_GUARD_WEBUI_BIND=0.0.0.0` puts the console on the LAN, and **requires
+`EMAIL_GUARD_WEBUI_TOKEN`**. That obligation is an operator's to keep: nothing inside the
+container can see which host interface the port was published on, so no code refuses the
+combination — `.env.sample` states it, and `tests/test_scanner_runner.py` holds the *default*
+to loopback so it cannot regress silently. Do not put the console on the public internet,
+including via a tunnel or a forwarded router port; a shared token answers "other people on my
+LAN", not the internet, and this console has no TLS of its own, no rate limiting and no
+lockout. Reach it from outside over a VPN into the LAN instead.
 
 Optional shared-token auth guards every `/api/` route: set `EMAIL_GUARD_WEBUI_TOKEN`, or put
 it in `config/secrets.json` under `webui.token` (git-ignored, like the bridge credentials —
@@ -1175,9 +1189,10 @@ are separate halves of the loop on purpose — so its copy of the applier is ine
 the scanner (`docker compose --profile build build scanner`) when the *scanning* path
 changes, `propose.py` included, since that is the half the scanner does run.
 
-The console publishes to loopback only — `127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}`
-— and shares the same data volume the dispatcher and scanner use, so it reads the candidates
-they stage and writes the lists they read back. Run it as your own uid (`EMAIL_GUARD_UID` /
+The console publishes to loopback by default —
+`${EMAIL_GUARD_WEBUI_BIND:-127.0.0.1}:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}`, see "Why it
+binds loopback" — and shares the same data volume the dispatcher and scanner use, so it reads
+the candidates they stage and writes the lists they read back. Run it as your own uid (`EMAIL_GUARD_UID` /
 `EMAIL_GUARD_GID`) to keep the lists hand-editable afterwards.
 
 **The state file and the data directories live on a named volume**, so a container recreate

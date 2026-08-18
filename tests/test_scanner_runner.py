@@ -264,21 +264,111 @@ def test_the_dispatcher_is_never_given_the_docker_socket():
     assert mounts[0].strip().endswith(":ro")
 
 
-def test_the_review_console_stays_on_loopback():
-    """The host port moved behind a variable; the loopback bind must not.
-
-    Dropping the `127.0.0.1:` prefix is one character between "localhost only"
-    and "a console that reads mail and edits delivery rules, on the LAN, over
-    plain HTTP". So the port is configurable and the interface is not.
-    """
-    published = [
+def _published_console_entries() -> list[str]:
+    """Every `ports:` entry in compose that publishes the console's 8080."""
+    return [
         line.strip().lstrip("- ").strip('"')
         for line in COMPOSE.splitlines()
         if line.strip().startswith('- "') and ":8080" in line
     ]
 
-    assert published == ['127.0.0.1:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080']
-    assert all(entry.startswith("127.0.0.1:") for entry in published)
+
+def _render(entry: str) -> str:
+    """Resolve `${VAR:-default}` the way compose does with NOTHING in the env.
+
+    This is the property that matters and the one a reading of the file can get
+    wrong: not "the line mentions 127.0.0.1 somewhere", but "with no `.env`, no
+    exported variables, nothing, the published address is loopback".
+    """
+    return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", r"\1", entry)
+
+
+def test_the_review_console_is_loopback_by_default():
+    """The interface is configurable now; the DEFAULT must still be loopback.
+
+    The bind address moved behind `EMAIL_GUARD_WEBUI_BIND` because the one
+    deploy that wanted LAN access was hand-editing this tracked file and
+    colliding with every `git pull`. Parameterising it is fine. What must never
+    happen is the default drifting: a fresh clone, an unset variable or a
+    missing `.env` has to stay loopback-only, because this console reads mail
+    and edits the lists that decide what gets delivered, over plain HTTP, with
+    no password unless one is configured.
+
+    So this asserts the substitution, not the spelling: rendered with an empty
+    environment, the published address is 127.0.0.1.
+    """
+    published = _published_console_entries()
+
+    assert published == [
+        "${EMAIL_GUARD_WEBUI_BIND:-127.0.0.1}:${EMAIL_GUARD_WEBUI_HOST_PORT:-8080}:8080"
+    ]
+    assert _render(published[0]) == "127.0.0.1:8080:8080"
+
+
+def test_the_console_bind_default_is_a_loopback_literal():
+    """Stated once more against the default alone, so a change to it is loud."""
+    published = _published_console_entries()
+    default = re.match(
+        r"^\$\{EMAIL_GUARD_WEBUI_BIND:-([^}]*)\}:", published[0]
+    )
+
+    assert default, "the console bind must come from EMAIL_GUARD_WEBUI_BIND"
+    assert default.group(1) == "127.0.0.1", (
+        "the fallback bind must be loopback -- an unset variable may never "
+        "expose the console on the LAN or the internet"
+    )
+
+
+def test_no_service_publishes_a_wildcard_address():
+    """The regression this guards: `0.0.0.0` hardcoded back into a `ports:` line.
+
+    `EMAIL_GUARD_WEBUI_HOST: 0.0.0.0` in the service ENVIRONMENT is a different
+    thing and is correct -- it binds the interface INSIDE the container, which
+    is what lets a published port reach the process at all. Only `ports:`
+    entries decide who can see it, so only those are checked here.
+    """
+    published = [
+        (name, str(entry))
+        for name, service in _compose()["services"].items()
+        for entry in (service.get("ports") or [])
+    ]
+
+    assert published, "no service publishes a port -- this test would pass vacuously"
+    offenders = [
+        (name, entry)
+        for name, entry in published
+        # A compose `ports:` entry is HOST[:CONTAINER] with an optional bind
+        # address first. Two colons means the address is present; one means it
+        # was omitted, which compose reads as every interface.
+        if _render(entry).count(":") < 2
+        or _render(entry).startswith(("0.0.0.0:", "*:", "::"))
+    ]
+
+    assert offenders == [], (
+        f"a published port defaults to a wildcard address: {offenders}"
+    )
+
+
+def test_the_console_still_requires_a_token_off_loopback():
+    """Parameterising the bind must not touch the auth wiring it depends on.
+
+    Compose cannot enforce "LAN needs a token" -- nothing in the container can
+    see which host interface the port was published on -- so the obligation is
+    documented in .env.sample instead, and the token plumbing has to stay
+    intact for an operator to be able to meet it.
+    """
+    environment = _compose()["services"]["webui"]["environment"]
+    sample = (DISPATCHER_PACKAGE.parents[1] / ".env.sample").read_text(encoding="utf-8")
+
+    assert environment["EMAIL_GUARD_WEBUI_TOKEN"] == "${EMAIL_GUARD_WEBUI_TOKEN:-}"
+    assert "EMAIL_GUARD_WEBUI_BIND" in sample
+    assert "EMAIL_GUARD_WEBUI_TOKEN" in sample
+    # The two must be documented together: the whole point is that turning one
+    # on obliges the other.
+    bind_section = sample[sample.index("EMAIL_GUARD_WEBUI_BIND") :]
+    assert "EMAIL_GUARD_WEBUI_TOKEN" in bind_section[:2000], (
+        "the .env sample must state that exposing the console requires the token"
+    )
 
 
 # -- the compose topology a live bring-up corrected ---------------------------
